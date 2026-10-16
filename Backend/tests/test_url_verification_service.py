@@ -50,6 +50,10 @@ def mock_public_dns(monkeypatch):
             "https://ambitionbox.com/jobs",
             "ambitionbox.com",
         ),
+        (
+            "https://apna.co/job/chennai-region/bde-123",
+            "apna.co",
+        ),
     ],
 )
 def test_trusted_domains_with_public_dns_are_accepted(

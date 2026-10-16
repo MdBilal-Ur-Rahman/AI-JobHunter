@@ -3,9 +3,12 @@ import { useAuth } from "../context/AuthContext"
 import {
   approveApplication,
   checkApplicationSubmissionGate,
+  deleteApplication,
   getApplications,
+  getMySearchResults,
   inspectApplication,
   mapApplicationFields,
+  saveJobAndTrack,
   updateApplicationStatus,
 } from "../services/api"
 
@@ -37,32 +40,65 @@ function formatDate(value) {
 function RecentApplications() {
   const { token } = useAuth()
   const [applications, setApplications] = useState([])
+  const [searchResults, setSearchResults] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState("")
+  const [searchResultsError, setSearchResultsError] = useState("")
   const [updatingId, setUpdatingId] = useState("")
+  const [deletingId, setDeletingId] = useState("")
   const [gateResults, setGateResults] = useState({})
   const [reviewResults, setReviewResults] = useState({})
   const [actionId, setActionId] = useState("")
+  const [savingResultId, setSavingResultId] = useState("")
+  const [savedResultIds, setSavedResultIds] = useState({})
+  const [saveResultMessages, setSaveResultMessages] = useState({})
 
   const loadApplications = useCallback(async () => {
     if (!token) {
+      setApplications([])
+      setSearchResults([])
       return
     }
 
-    try {
-      const response = await getApplications(token)
+    const [applicationsResult, searchResultsResult] =
+      await Promise.allSettled([
+        getApplications(token),
+        getMySearchResults(token),
+      ])
+
+    if (applicationsResult.status === "fulfilled") {
       setError("")
       setApplications(
-        Array.isArray(response?.applications)
-          ? response.applications
+        Array.isArray(applicationsResult.value?.applications)
+          ? applicationsResult.value.applications
           : []
       )
-    } catch (loadError) {
-      console.error("Failed to load applications:", loadError)
-      setError(getErrorMessage(loadError))
-    } finally {
-      setLoading(false)
+    } else {
+      console.error(
+        "Failed to load applications:",
+        applicationsResult.reason
+      )
+      setError(getErrorMessage(applicationsResult.reason))
     }
+
+    if (searchResultsResult.status === "fulfilled") {
+      setSearchResultsError("")
+      setSearchResults(
+        Array.isArray(searchResultsResult.value?.results)
+          ? searchResultsResult.value.results
+          : []
+      )
+    } else {
+      console.error(
+        "Failed to load live job results:",
+        searchResultsResult.reason
+      )
+      setSearchResultsError(
+        getErrorMessage(searchResultsResult.reason)
+      )
+    }
+
+    setLoading(false)
   }, [token])
 
   useEffect(() => {
@@ -74,9 +110,17 @@ function RecentApplications() {
       loadApplications()
     }
 
+    function handleJobsSearchCompleted() {
+      loadApplications()
+    }
+
     window.addEventListener(
       "applications-updated",
       handleApplicationsUpdated
+    )
+    window.addEventListener(
+      "jobs-search-completed",
+      handleJobsSearchCompleted
     )
 
     return () => {
@@ -85,11 +129,20 @@ function RecentApplications() {
         "applications-updated",
         handleApplicationsUpdated
       )
+      window.removeEventListener(
+        "jobs-search-completed",
+        handleJobsSearchCompleted
+      )
     }
   }, [loadApplications])
 
   async function handleStatusChange(applicationId, status) {
-    if (!token || !applicationId || updatingId) {
+    if (
+      !token ||
+      !applicationId ||
+      updatingId ||
+      deletingId === applicationId
+    ) {
       return
     }
 
@@ -125,6 +178,39 @@ function RecentApplications() {
       setError(getErrorMessage(updateError))
     } finally {
       setUpdatingId("")
+    }
+  }
+
+  async function handleDeleteApplication(applicationId, title) {
+    if (
+      !token ||
+      !applicationId ||
+      deletingId ||
+      !window.confirm(
+        `Delete "${title}" from your application tracker? This cannot be undone.`
+      )
+    ) {
+      return
+    }
+
+    setDeletingId(applicationId)
+    setError("")
+
+    try {
+      await deleteApplication(applicationId, token)
+      setApplications((current) =>
+        current.filter(
+          (application) =>
+            application.application_id !== applicationId
+        )
+      )
+      window.dispatchEvent(new Event("applications-updated"))
+      window.dispatchEvent(new Event("dashboard-summary-updated"))
+    } catch (deleteError) {
+      console.error("Failed to delete application:", deleteError)
+      setError(getErrorMessage(deleteError))
+    } finally {
+      setDeletingId("")
     }
   }
 
@@ -248,6 +334,65 @@ function RecentApplications() {
     loadApplications()
   }
 
+  async function handleSaveSearchResult(result) {
+    const resultId = result?.search_result_id || result?._id
+    if (
+      !token ||
+      typeof resultId !== "string" ||
+      !/^[a-fA-F0-9]{24}$/.test(resultId) ||
+      result.url_verified !== true ||
+      savingResultId
+    ) {
+      return
+    }
+
+    setSavingResultId(resultId)
+    setSaveResultMessages((current) => ({
+      ...current,
+      [resultId]: "",
+    }))
+
+    try {
+      const response = await saveJobAndTrack(resultId, token)
+      if (!response.saved) {
+        setSaveResultMessages((current) => ({
+          ...current,
+          [resultId]:
+            response.saveResponse?.message || "This result was not saved.",
+        }))
+        return
+      }
+
+      setSavedResultIds((current) => ({
+        ...current,
+        [resultId]: true,
+      }))
+      setSaveResultMessages((current) => ({
+        ...current,
+        [resultId]: response.tracked
+          ? "Job saved and added to your Application Tracker."
+          : `Job saved, but not added to the tracker: ${
+              response.trackingMessage ||
+              response.trackingError?.message ||
+              "the tracker could not be updated."
+            }`,
+      }))
+      window.dispatchEvent(new Event("saved-jobs-updated"))
+      if (response.tracked) {
+        window.dispatchEvent(new Event("applications-updated"))
+      }
+      window.dispatchEvent(new Event("dashboard-summary-updated"))
+    } catch (saveError) {
+      console.error("Failed to save live search result:", saveError)
+      setSaveResultMessages((current) => ({
+        ...current,
+        [resultId]: getErrorMessage(saveError),
+      }))
+    } finally {
+      setSavingResultId("")
+    }
+  }
+
   return (
     <section className="w-full rounded-xl border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-700 dark:bg-gray-900 sm:p-6">
       <div className="mb-5 flex items-center justify-between gap-3">
@@ -269,6 +414,125 @@ function RecentApplications() {
         </button>
       </div>
 
+      <div className="mb-6">
+        <h4 className="mb-1 text-base font-semibold text-gray-900 dark:text-white">
+          Live Job Results
+        </h4>
+        <p className="mb-3 text-sm text-gray-500 dark:text-gray-400">
+          Recent jobs found by your searches. Check each posting and employer
+          before applying; a valid URL does not guarantee the job is genuine
+          or still open.
+        </p>
+
+        {searchResultsError ? (
+          <p
+            className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-800 dark:bg-red-950/30 dark:text-red-300"
+            role="alert"
+          >
+            Could not load live job results: {searchResultsError}
+          </p>
+        ) : searchResults.length === 0 ? (
+          <p className="rounded-lg border border-dashed border-gray-300 px-4 py-5 text-center text-sm text-gray-500 dark:border-gray-600 dark:text-gray-400">
+            No live job results yet. Search for jobs on the dashboard to see
+            them here.
+          </p>
+        ) : (
+          <div className="space-y-3">
+            {searchResults.map((result, index) => {
+              const resultId =
+                result.search_result_id || result._id || result.url
+              const jobUrl = result.url
+              let safeJobUrl = ""
+
+              try {
+                const parsedUrl = new URL(jobUrl)
+                if (
+                  ["http:", "https:"].includes(parsedUrl.protocol) &&
+                  !parsedUrl.username &&
+                  !parsedUrl.password
+                ) {
+                  safeJobUrl = parsedUrl.href
+                }
+              } catch {
+                safeJobUrl = ""
+              }
+
+              return (
+                <article
+                  key={resultId || `search-result-${index}`}
+                  className="rounded-lg border border-gray-200 p-4 dark:border-gray-700"
+                >
+                  <h5 className="font-semibold text-gray-900 dark:text-white">
+                    {result.title || "Untitled job"}
+                  </h5>
+                  <p className="mt-1 text-sm text-gray-600 dark:text-gray-400">
+                    {result.company || "Employer not specified"}
+                    {result.location ? ` · ${result.location}` : ""}
+                  </p>
+                  {result.location_confirmed === false &&
+                    result.location_query && (
+                      <p className="mt-1 text-xs text-amber-700 dark:text-amber-300">
+                        The posting does not confirm{" "}
+                        {result.location_query}; verify the location before
+                        applying.
+                      </p>
+                    )}
+                  <p className="mt-2 text-xs text-amber-700 dark:text-amber-400">
+                    {result.url_verified === true
+                      ? "Web result · Job authenticity not verified"
+                      : "Manual review required · URL not verified"}
+                  </p>
+                  {safeJobUrl && (
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <a
+                        href={safeJobUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        referrerPolicy="no-referrer"
+                        className="inline-flex rounded-lg border border-gray-300 px-3 py-2 text-xs font-semibold text-gray-700 hover:bg-gray-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-800"
+                      >
+                        View job posting
+                      </a>
+                      {result.url_verified === true &&
+                        typeof resultId === "string" &&
+                        /^[a-fA-F0-9]{24}$/.test(resultId) && (
+                          <button
+                            type="button"
+                            onClick={() => handleSaveSearchResult(result)}
+                            disabled={
+                              Boolean(savingResultId) ||
+                              Boolean(savedResultIds[resultId])
+                            }
+                            className="inline-flex rounded-lg bg-green-600 px-3 py-2 text-xs font-semibold text-white hover:bg-green-700 disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            {savingResultId === resultId
+                              ? "Saving..."
+                              : savedResultIds[resultId]
+                                ? "Saved"
+                                : "Save Job"}
+                          </button>
+                        )}
+                    </div>
+                  )}
+                  {saveResultMessages[resultId] && (
+                    <p
+                      className="mt-2 text-xs text-gray-600 dark:text-gray-400"
+                      role="status"
+                    >
+                      {saveResultMessages[resultId]}
+                    </p>
+                  )}
+                </article>
+              )
+            })}
+          </div>
+        )}
+      </div>
+
+      <div className="pt-5">
+        <h4 className="mb-3 text-base font-semibold text-gray-900 dark:text-white">
+          Application Tracker
+        </h4>
       {error && (
         <p
           className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-800 dark:bg-red-950/30 dark:text-red-300"
@@ -300,6 +564,23 @@ function RecentApplications() {
               application?.job?.title || "Untitled job"
             const company =
               application?.job?.company || "Not specified"
+            const review = reviewResults[application.application_id]
+            const inspection = review?.result?.inspection
+            const mapping = review?.result?.mapping
+            const mappedFields = Array.isArray(mapping?.mappings)
+              ? mapping.mappings
+              : []
+            const visibleInputs = Array.isArray(inspection?.forms)
+              ? inspection.forms.flatMap((form) =>
+                  (form.inputs || []).filter((input) => {
+                    const identity = `${input.name || ""} ${input.id || ""}`
+                    return (
+                      input.type !== "hidden" &&
+                      !/password|csrf|session|token/i.test(identity)
+                    )
+                  })
+                )
+              : []
 
             return (
               <article
@@ -321,34 +602,56 @@ function RecentApplications() {
                       Created {formatDate(application.created_at)}
                     </p>
                   </div>
-                  <label className="text-sm text-gray-600 dark:text-gray-300">
-                    Status
-                    <select
-                      value={
-                        APPLICATION_STATUSES.includes(
-                          application.status
-                        )
-                          ? application.status
-                          : "discovered"
-                      }
-                      onChange={(event) =>
-                        handleStatusChange(
+                  <div className="flex w-full items-end gap-2 sm:w-auto">
+                    <label className="min-w-0 flex-1 text-sm text-gray-600 dark:text-gray-300 sm:w-48 sm:flex-none">
+                      Status
+                      <select
+                        value={
+                          APPLICATION_STATUSES.includes(
+                            application.status
+                          )
+                            ? application.status
+                            : "discovered"
+                        }
+                        onChange={(event) =>
+                          handleStatusChange(
+                            application.application_id,
+                            event.target.value
+                          )
+                        }
+                        disabled={
+                          updatingId === application.application_id ||
+                          deletingId === application.application_id
+                        }
+                        className="mt-1 block w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 disabled:opacity-50 dark:border-gray-600 dark:bg-gray-800 dark:text-white"
+                      >
+                        {APPLICATION_STATUSES.map((status) => (
+                          <option key={status} value={status}>
+                            {status.replaceAll("-", " ")}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleDeleteApplication(
                           application.application_id,
-                          event.target.value
+                          title
                         )
                       }
                       disabled={
-                        updatingId === application.application_id
+                        Boolean(deletingId) ||
+                        updatingId === application.application_id ||
+                        actionId === application.application_id
                       }
-                      className="mt-1 block w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 disabled:opacity-50 dark:border-gray-600 dark:bg-gray-800 dark:text-white"
+                      className="h-[38px] shrink-0 rounded-lg border border-red-300 px-3 text-sm font-semibold text-red-700 transition hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-950/40"
                     >
-                      {APPLICATION_STATUSES.map((status) => (
-                        <option key={status} value={status}>
-                          {status.replaceAll("-", " ")}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
+                      {deletingId === application.application_id
+                        ? "Deleting..."
+                        : "Delete"}
+                    </button>
+                  </div>
                 </div>
                 <div className="mt-3 flex flex-wrap gap-2">
                   <button
@@ -356,7 +659,10 @@ function RecentApplications() {
                     onClick={() =>
                       handleInspectApplication(application.application_id)
                     }
-                    disabled={actionId === application.application_id}
+                    disabled={
+                      actionId === application.application_id ||
+                      deletingId === application.application_id
+                    }
                     className="rounded-lg border border-gray-300 px-3 py-2 text-xs font-semibold text-gray-700 hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-800"
                   >
                     {actionId === application.application_id
@@ -370,56 +676,105 @@ function RecentApplications() {
                         application.application_id
                       )
                     }
-                    disabled={actionId === application.application_id}
+                    disabled={
+                      actionId === application.application_id ||
+                      deletingId === application.application_id
+                    }
                     className="rounded-lg border border-gray-300 px-3 py-2 text-xs font-semibold text-gray-700 hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-800"
                   >
                     Map verified resume fields
                   </button>
                 </div>
-                {reviewResults[application.application_id] && (
+                {review && (
                   <div
                     className="mt-3 rounded-lg bg-gray-50 p-3 dark:bg-gray-800"
                     role="status"
                   >
                     <p className="text-xs font-semibold text-gray-700 dark:text-gray-200">
-                      {reviewResults[application.application_id].type ===
-                      "mapping"
+                      {review.type === "mapping"
                         ? "Verified-resume field mapping"
                         : "Application page inspection"}
                     </p>
                     <p className="mt-1 text-xs text-gray-600 dark:text-gray-400">
-                      {reviewResults[application.application_id].result
-                        ?.message ||
-                        "Review data is available."}{" "}
+                      {review.result?.message || "Review data is available."}{" "}
                       No application was submitted.
                     </p>
-                    {reviewResults[application.application_id].result
-                      ?.safety_note && (
+                    {review.result?.safety_note && (
                       <p className="mt-1 text-xs text-gray-600 dark:text-gray-400">
-                        {
-                          reviewResults[
-                            application.application_id
-                          ].result.safety_note
-                        }
+                        {review.result.safety_note}
                       </p>
                     )}
                     <details className="mt-2">
                       <summary className="cursor-pointer text-xs font-medium text-blue-700 dark:text-blue-300">
                         View review details
                       </summary>
-                      <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded bg-white p-2 text-xs text-gray-700 dark:bg-gray-900 dark:text-gray-300">
-                        {JSON.stringify(
-                          reviewResults[application.application_id].result
-                            ?.inspection ??
-                            reviewResults[application.application_id].result
-                              ?.mapping ??
-                            reviewResults[application.application_id].result
-                              ?.verification ??
-                            reviewResults[application.application_id].result,
-                          null,
-                          2
+                      <div className="mt-2 space-y-2 rounded bg-white p-3 text-xs text-gray-700 dark:bg-gray-900 dark:text-gray-300">
+                        {review.type === "inspection" && inspection && (
+                          <>
+                            {inspection.title && (
+                              <p>
+                                <span className="font-semibold">Page:</span>{" "}
+                                {inspection.title}
+                              </p>
+                            )}
+                            <p>
+                              <span className="font-semibold">Forms found:</span>{" "}
+                              {inspection.form_count ?? inspection.forms?.length ?? 0}
+                            </p>
+                            {inspection.blocked && (
+                              <p>
+                                <span className="font-semibold">Access:</span>{" "}
+                                Sign-in or page restrictions were detected.
+                              </p>
+                            )}
+                            {visibleInputs.length > 0 && (
+                              <div>
+                                <p className="font-semibold">
+                                  Visible form fields:
+                                </p>
+                                <ul className="mt-1 list-inside list-disc">
+                                  {visibleInputs.slice(0, 12).map((input, index) => (
+                                    <li key={`${input.name || input.id || "field"}-${index}`}>
+                                      {input.placeholder ||
+                                        input.name ||
+                                        input.id ||
+                                        `${input.type || "text"} field`}
+                                    </li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+                            {visibleInputs.length === 0 && (
+                              <p>
+                                No safe, user-facing form fields were available
+                                to display.
+                              </p>
+                            )}
+                          </>
                         )}
-                      </pre>
+                        {review.type === "mapping" && (
+                          mappedFields.length > 0 ? (
+                            <ul className="space-y-1">
+                              {mappedFields.map((field, index) => (
+                                <li key={`${field.field_name || field.name || "field"}-${index}`}>
+                                  <span className="font-semibold">
+                                    {field.field_name || field.name || "Form field"}:
+                                  </span>{" "}
+                                  {field.available && field.value
+                                    ? field.value
+                                    : "Not found in verified resume"}
+                                </li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <p>No verified-resume field mappings were found.</p>
+                          )
+                        )}
+                        {review.type !== "inspection" &&
+                          review.type !== "mapping" && (
+                            <p>No additional readable review details.</p>
+                          )}
+                      </div>
                     </details>
                   </div>
                 )}
@@ -433,7 +788,10 @@ function RecentApplications() {
                       onClick={() =>
                         handleApprove(application.application_id)
                       }
-                      disabled={actionId === application.application_id}
+                      disabled={
+                        actionId === application.application_id ||
+                        deletingId === application.application_id
+                      }
                       className="mt-2 rounded-lg border border-amber-400 px-3 py-2 text-xs font-semibold text-amber-800 hover:bg-amber-50 disabled:opacity-50 dark:text-amber-300 dark:hover:bg-amber-950"
                     >
                       {actionId === application.application_id
@@ -451,7 +809,10 @@ function RecentApplications() {
                           application.application_id
                         )
                       }
-                      disabled={actionId === application.application_id}
+                      disabled={
+                        actionId === application.application_id ||
+                        deletingId === application.application_id
+                      }
                       className="rounded-lg border border-blue-300 px-3 py-2 text-xs font-semibold text-blue-700 hover:bg-blue-50 disabled:opacity-50 dark:border-blue-700 dark:text-blue-300 dark:hover:bg-blue-950"
                     >
                       {actionId === application.application_id
@@ -477,7 +838,7 @@ function RecentApplications() {
           })}
         </div>
       )}
-
+      </div>
     </section>
   )
 }

@@ -4,8 +4,61 @@ import { useAuth } from "../context/AuthContext"
 import {
   searchJobs,
   getMySearchResults,
-  normalizeAndStoreJob,
+  saveJobAndTrack,
 } from "../services/api"
+
+function extractJobs(data) {
+  if (Array.isArray(data)) {
+    return data
+  }
+
+  if (!data || typeof data !== "object") {
+    return []
+  }
+
+  if (Array.isArray(data.searches)) {
+    return data.searches.flatMap((search) =>
+      Array.isArray(search?.saved_results)
+        ? search.saved_results
+        : []
+    )
+  }
+
+  const possibleKeys = [
+    "results",
+    "jobs",
+    "data",
+    "items",
+    "search_results",
+    "job_results",
+    "documents",
+    "saved_results",
+  ]
+
+  for (const key of possibleKeys) {
+    if (Array.isArray(data[key])) {
+      return data[key]
+    }
+  }
+
+  if (data.data && typeof data.data === "object") {
+    return extractJobs(data.data)
+  }
+
+  return []
+}
+
+function collectSearchItems(data, key) {
+  if (!Array.isArray(data?.searches)) {
+    return []
+  }
+
+  return data.searches.flatMap((search) =>
+    Array.isArray(search?.[key])
+      ? search[key]
+      : []
+  )
+}
 
 function JobSearch() {
   const { token } = useAuth()
@@ -36,16 +89,28 @@ function JobSearch() {
     async function loadPreviouslyDiscoveredJobs() {
       try {
         const response = await getMySearchResults(token)
+        const previousResults = Array.isArray(response?.results)
+          ? response.results
+          : []
 
         if (
-          isCurrent &&
-          jobsLoadId.current === loadId
+          !isCurrent ||
+          jobsLoadId.current !== loadId
         ) {
-          setJobs(response.results)
+          return
         }
+
+        if (previousResults.length > 0) {
+          setJobs(previousResults)
+          return
+        }
+
+        setMessage(
+          "No matching results yet. Search by job title and location to find relevant openings."
+        )
       } catch (err) {
         console.error(
-          "Failed to load previously discovered jobs:",
+          "Failed to load or find jobs:",
           err
         )
 
@@ -55,8 +120,15 @@ function JobSearch() {
         ) {
           setError(
             err?.message ||
-              "Failed to load previously discovered jobs."
+            "Unable to load job results. Please try again."
           )
+        }
+      } finally {
+        if (
+          isCurrent &&
+          jobsLoadId.current === loadId
+        ) {
+          setIsSearching(false)
         }
       }
     }
@@ -67,48 +139,6 @@ function JobSearch() {
       isCurrent = false
     }
   }, [token])
-
-  // Extract job results from supported backend response formats.
-  function extractJobs(data) {
-    if (Array.isArray(data)) {
-      return data
-    }
-
-    if (!data || typeof data !== "object") {
-      return []
-    }
-
-    if (Array.isArray(data.searches)) {
-      return data.searches.flatMap((search) =>
-        Array.isArray(search?.saved_results)
-          ? search.saved_results
-          : []
-      )
-    }
-
-    const possibleKeys = [
-      "results",
-      "jobs",
-      "data",
-      "items",
-      "search_results",
-      "job_results",
-      "documents",
-      "saved_results",
-    ]
-
-    for (const key of possibleKeys) {
-      if (Array.isArray(data[key])) {
-        return data[key]
-      }
-    }
-
-    if (data.data && typeof data.data === "object") {
-      return extractJobs(data.data)
-    }
-
-    return []
-  }
 
   function getJobKey(job, index) {
     return (
@@ -336,18 +366,6 @@ function JobSearch() {
     }
   }
 
-  function collectSearchItems(data, key) {
-    if (!Array.isArray(data?.searches)) {
-      return []
-    }
-
-    return data.searches.flatMap((search) =>
-      Array.isArray(search?.[key])
-        ? search[key]
-        : []
-    )
-  }
-
   // Save an individual job through the existing backend endpoint.
   async function handleSaveJob(job) {
     const searchResultId = job?.search_result_id
@@ -393,30 +411,42 @@ function JobSearch() {
     }))
 
     try {
-      const response = await normalizeAndStoreJob(
+      const response = await saveJobAndTrack(
         searchResultId,
         token
       )
 
-      if (response?.is_individual_job === false) {
-        setSaveMessages((previous) => ({
+      if (!response.saved) {
+        setSaveErrors((previous) => ({
           ...previous,
           [searchResultId]:
-            "This result is a general search page, not an individual job posting. It was not added to Saved Jobs.",
+            response.saveResponse?.message ||
+            "This result was not saved. Choose an individual job posting, not a review or job-search page.",
         }))
         return
       }
 
+      const trackerMessage = response.tracked
+        ? " Added to your Application Tracker."
+        : ` Not added to the tracker: ${
+            response.trackingMessage ||
+            response.trackingError?.message ||
+            "the tracker could not be updated."
+          }`
       setSaveMessages((previous) => ({
         ...previous,
         [searchResultId]:
-          response?.message || "Job saved successfully.",
+          `Job saved successfully.${trackerMessage}`,
       }))
 
       // Notify SavedJobs.jsx to refresh its list.
       window.dispatchEvent(
         new CustomEvent("saved-jobs-updated")
       )
+      if (response.tracked) {
+        window.dispatchEvent(new Event("applications-updated"))
+      }
+      window.dispatchEvent(new Event("dashboard-summary-updated"))
     } catch (err) {
       console.error("Failed to save job:", err)
 
@@ -465,11 +495,6 @@ function JobSearch() {
         token
       )
 
-      console.log(
-        "TAVILY RESPONSE JSON:",
-        JSON.stringify(data, null, 2)
-      )
-
       const results = extractJobs(data)
 
       const blocked = collectSearchItems(
@@ -481,10 +506,6 @@ function JobSearch() {
         data,
         "invalid_urls"
       )
-
-      console.log("EXTRACTED JOBS:", results)
-      console.log("BLOCKED URLS:", blocked)
-      console.log("INVALID URLS:", invalid)
 
       setJobs(results)
       setBlockedUrls(blocked)
@@ -512,6 +533,13 @@ function JobSearch() {
       const totalBlocked =
         Number(data?.total_verification_blocked) ||
         blocked.length
+
+      const totalNonJobResults =
+        Number(data?.total_non_job_results) || 0
+      const totalIrrelevantResults =
+        Number(data?.total_irrelevant_results) || 0
+      const totalStorageErrors =
+        Number(data?.total_storage_errors) || 0
 
       const summaryParts = []
 
@@ -554,6 +582,24 @@ function JobSearch() {
       if (totalBlocked > 0) {
         summaryParts.push(
           `${totalBlocked} URL(s) require manual review`
+        )
+      }
+
+      if (totalNonJobResults > 0) {
+        summaryParts.push(
+          `${totalNonJobResults} non-job result(s) skipped`
+        )
+      }
+
+      if (totalIrrelevantResults > 0) {
+        summaryParts.push(
+          `${totalIrrelevantResults} result(s) skipped because the job title or location did not match`
+        )
+      }
+
+      if (totalStorageErrors > 0) {
+        summaryParts.push(
+          `${totalStorageErrors} result(s) could not be stored for display`
         )
       }
 
@@ -625,7 +671,9 @@ function JobSearch() {
         </h2>
 
         <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
-          Discover jobs matching your skills and preferred location.
+          Search by job title and location. Unrelated roles and confirmed
+          location mismatches are filtered out; verify the posting when its
+          location is not specified.
         </p>
       </div>
 
@@ -636,7 +684,7 @@ function JobSearch() {
               htmlFor="job-title"
               className="mb-2 block text-sm font-medium text-gray-700 dark:text-gray-300"
             >
-              Job Title / Skill
+              Job Domain / Title
             </label>
 
             <input
@@ -646,7 +694,7 @@ function JobSearch() {
               onChange={(event) =>
                 setJobTitle(event.target.value)
               }
-              placeholder="e.g. React, Python, Developer"
+              placeholder="e.g. Data Science, Frontend Developer"
               disabled={isSearching}
               className="w-full rounded-lg border border-gray-300 bg-white px-4 py-3 text-sm text-gray-900 outline-none transition placeholder:text-gray-400 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 disabled:cursor-not-allowed disabled:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:placeholder:text-gray-500 dark:disabled:bg-gray-700"
             />
@@ -735,9 +783,9 @@ function JobSearch() {
           </div>
 
           <p className="mb-3 text-xs text-gray-500 dark:text-gray-400">
-            Discovered results are retained here. Only individual
-            postings that pass normalization and URL checks are added
-            to Saved Jobs.
+            Live web results are prioritized from recognized job boards.
+            URL checks do not confirm that a job is genuine or still open;
+            review the employer and posting before applying.
           </p>
 
           <div className="space-y-3">
@@ -763,6 +811,8 @@ function JobSearch() {
               const hasValidSearchResultId =
                 typeof searchResultId === "string" &&
                 /^[a-fA-F0-9]{24}$/.test(searchResultId)
+              const canSaveJob =
+                hasValidSearchResultId && urlVerified
 
               return (
                 <article
@@ -790,6 +840,15 @@ function JobSearch() {
                           {jobLocation}
                         </p>
 
+                        {job?.location_confirmed === false &&
+                          job?.location_query && (
+                            <p className="text-amber-700 dark:text-amber-300">
+                              The posting does not confirm{" "}
+                              {job.location_query}; verify the location on
+                              the employer's page.
+                            </p>
+                          )}
+
                         {employmentType && (
                           <p>
                             <span className="font-medium">
@@ -808,6 +867,11 @@ function JobSearch() {
                           </p>
                         )}
                       </div>
+                      {!urlVerified && (
+                        <p className="mt-3 inline-flex rounded-full bg-amber-100 px-3 py-1 text-xs font-medium text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
+                          Manual review required · URL not verified
+                        </p>
+                      )}
                     </div>
 
                     {salary && (
@@ -848,7 +912,7 @@ function JobSearch() {
                         View Job
                       </ExternalLink>
 
-                      {hasValidSearchResultId && (
+                      {canSaveJob && (
                         <button
                           type="button"
                           onClick={() => handleSaveJob(job)}
@@ -862,7 +926,7 @@ function JobSearch() {
                       )}
                     </div>
 
-                    {hasValidSearchResultId &&
+                    {canSaveJob &&
                       saveMessages[searchResultId] && (
                         <p
                           className="mt-3 text-sm text-green-700 dark:text-green-400"
@@ -872,7 +936,7 @@ function JobSearch() {
                         </p>
                       )}
 
-                    {hasValidSearchResultId &&
+                    {canSaveJob &&
                       saveErrors[searchResultId] && (
                         <p
                           className="mt-3 text-sm text-red-600 dark:text-red-400"
@@ -886,7 +950,7 @@ function JobSearch() {
                       {jobVerified
                         ? "Job authenticity has been verified by the backend."
                         : urlVerified
-                          ? "URL checks passed. Job authenticity has not been independently verified."
+                                  ? "URL passed the site's basic safety checks. The individual posting, employer, and job availability are not verified."
                           : "Review the destination and job details carefully before applying."}
                     </p>
                   </div>

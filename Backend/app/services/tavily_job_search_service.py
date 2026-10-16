@@ -6,6 +6,7 @@ from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from pymongo.errors import DuplicateKeyError
 
 from app.services.url_verification_service import (
+    TRUSTED_JOB_DOMAINS,
     verify_application_url,
 )
 
@@ -213,6 +214,181 @@ def _extract_location(
     return None
 
 
+def _query_tokens(value: str) -> set[str]:
+    tokens = set(re.findall(r"[a-z0-9]+", value.lower()))
+    if "reactjs" in tokens:
+        tokens.remove("reactjs")
+        tokens.add("react")
+    return tokens
+
+
+def _title_tokens_match(
+    requested_tokens: set[str],
+    title_tokens: set[str],
+    content_tokens: set[str],
+) -> bool:
+    role_synonyms = (
+        {"developer", "development", "engineer", "engineering"},
+    )
+
+    for synonym_group in role_synonyms:
+        requested_group = requested_tokens & synonym_group
+        if requested_group:
+            requested_tokens = (
+                requested_tokens - requested_group
+            ) | {"__role__"}
+        title_group = title_tokens & synonym_group
+        if title_group:
+            title_tokens = (title_tokens - title_group) | {"__role__"}
+
+    role_tokens = {
+        token
+        for synonym_group in role_synonyms
+        for token in synonym_group
+    }
+    requested_role_tokens = requested_tokens & role_tokens
+    if requested_role_tokens and not title_tokens.intersection(role_tokens):
+        return False
+
+    requested_specialty_tokens = requested_tokens - role_tokens
+    return requested_specialty_tokens.issubset(
+        title_tokens | content_tokens
+    )
+
+
+def _search_topics(value: str) -> set[str]:
+    topic_patterns = {
+        "react": r"\breact(?:\.js|js)?\b",
+        "frontend": r"\bfront[\s-]?end\b",
+        "backend": r"\bback[\s-]?end\b",
+        "mern": r"\bmern\b",
+    }
+    return {
+        topic
+        for topic, pattern in topic_patterns.items()
+        if re.search(pattern, value, re.IGNORECASE)
+    }
+
+
+def _matches_search_topic(
+    topic: str,
+    searchable_text: str,
+) -> bool:
+    topic_patterns = {
+        "react": r"\breact(?:\.js|js)?\b",
+        "frontend": (
+            r"\bfront[\s-]?end\b|\bui\b|\buser interface\b"
+        ),
+        "backend": (
+            r"\bback[\s-]?end\b|\bserver[\s-]?side\b"
+        ),
+        "mern": r"\bmern\b",
+    }
+    if re.search(topic_patterns[topic], searchable_text, re.IGNORECASE):
+        return True
+
+    if topic == "mern":
+        stack_components = (
+            r"\bmongo(?:db)?\b",
+            r"\bexpress(?:\.js)?\b",
+            r"\breact(?:\.js|js)?\b",
+            r"\bnode(?:\.js|js)?\b",
+        )
+        return sum(
+            bool(re.search(pattern, searchable_text, re.IGNORECASE))
+            for pattern in stack_components
+        ) >= 2
+
+    return False
+
+
+def _expand_job_search_query(query: str) -> str:
+    topic_expansions = {
+        "react": "React React.js ReactJS",
+        "frontend": "frontend front-end front end UI developer",
+        "backend": "backend back-end back end server-side developer",
+        "mern": "MERN MongoDB Express React Node.js full stack",
+    }
+    expansions = [
+        expansion
+        for topic, expansion in topic_expansions.items()
+        if topic in _search_topics(query)
+    ]
+    query_text = " ".join([query, *expansions])
+    return (
+        f"{query_text} current individual job openings hiring careers "
+        "apply now for all experience levels including fresher, entry "
+        "level, junior, mid-level, senior, and experienced; do not limit "
+        "by experience. exclude tutorials, documentation, courses, and "
+        "informational pages."
+    )
+
+
+def _matches_requested_criteria(
+    *,
+    title: str,
+    content: str,
+    location: str | None,
+    job_title_query: str | None,
+    location_query: str | None,
+) -> bool:
+    searchable_text = f"{title}\n{content[:MAX_CONTENT_SCAN_LENGTH]}"
+
+    if job_title_query:
+        ignored_terms = {
+            "a", "an", "and", "at", "for", "in", "job", "jobs",
+            "now", "opening", "openings", "the", "to",
+        }
+        requested_title_tokens = _query_tokens(job_title_query) - ignored_terms
+        topics = _search_topics(job_title_query)
+        topic_tokens = {
+            "react": {"react", "reactjs", "js"},
+            "frontend": {"front", "end", "frontend"},
+            "backend": {"back", "end", "backend"},
+            "mern": {"mern", "stack"},
+        }
+        for topic in topics:
+            requested_title_tokens -= topic_tokens[topic]
+
+        title_tokens = _query_tokens(title)
+        content_tokens = _query_tokens(
+            content[:MAX_CONTENT_SCAN_LENGTH]
+        )
+        if not all(
+            _matches_search_topic(topic, searchable_text)
+            for topic in topics
+        ):
+            return False
+
+        if not _title_tokens_match(
+            requested_title_tokens,
+            title_tokens,
+            content_tokens,
+        ):
+            return False
+
+    if location_query:
+        requested_location_tokens = _query_tokens(location_query)
+        if location and not requested_location_tokens.issubset(
+            _query_tokens(location)
+        ):
+            return False
+
+    return True
+
+
+def _location_is_confirmed(
+    *,
+    location: str | None,
+    location_query: str | None,
+) -> bool:
+    if not location:
+        return False
+    if not location_query:
+        return True
+    return _query_tokens(location_query).issubset(_query_tokens(location))
+
+
 def _extract_employment_type(
     content: str,
 ) -> str | None:
@@ -278,17 +454,45 @@ def _is_listing_page(
     listing_path_patterns = [
         r"/jobs/?$",
         r"/jobs-in-[^/]+/?$",
+        r"/jobs-for-[^/]+(?:/.*)?$",
         r"/job-search/?$",
+        r"/search-jobs(?:/|\.|$)",
         r"/search/jobs/?$",
         r"/vacancies/?$",
         r"/job-openings/?$",
+        r"/current-(?:job-)?openings?(?:/|\.|$)",
         r"/careers/?$",
         r"/role/l/?$",
+        r"/q-[^/]+-jobs\.html$",
     ]
 
     for pattern in listing_path_patterns:
         if re.search(pattern, path):
             return True
+
+    hostname = (urlparse(url).hostname or "").lower().rstrip(".")
+    if hostname.startswith(("careers.", "career.")) and path in {"", "/"}:
+        return True
+
+    if (
+        hostname == "smartrecruiters.com"
+        or hostname.endswith(".smartrecruiters.com")
+    ):
+        path_segments = [segment for segment in path.split("/") if segment]
+        if len(path_segments) == 1:
+            return True
+
+    query_parameters = {
+        key.lower()
+        for key, _ in parse_qsl(parsed.query, keep_blank_values=True)
+    }
+
+    if (
+        query_parameters
+        & {"q", "query", "keywords", "search", "location", "l"}
+        and re.search(r"/(?:jobs?|search)(?:/|$)", path)
+    ):
+        return True
 
     listing_title_patterns = [
         r"\bjob vacancies\b",
@@ -297,11 +501,118 @@ def _is_listing_page(
         r"\bsearch results\b",
         r"\bopen roles\b",
         r"\bjob listings\b",
+        r"\bnew jobs daily\b",
+        r"\bstart applying now\b",
+        r"^\s*\d+\+?\s+.+\bjobs?\b.*\bemployment\b",
     ]
 
-    return any(
-        re.search(pattern, title_lower)
-        for pattern in listing_title_patterns
+    return (
+        path in {"", "/"}
+        or any(
+            re.search(pattern, title_lower)
+            for pattern in listing_title_patterns
+        )
+    )
+
+
+def _is_non_job_resource(
+    title: str,
+    url: str,
+) -> bool:
+    """Filter clearly informational pages before URL review or storage."""
+    try:
+        parsed_url = urlparse(url)
+        hostname = (parsed_url.hostname or "").lower().rstrip(".")
+        path = (parsed_url.path or "").lower()
+    except (TypeError, ValueError):
+        return False
+
+    informational_domains = (
+        "wikipedia.org",
+        "react.dev",
+        "legacy.reactjs.org",
+        "geeksforgeeks.org",
+        "w3schools.com",
+    )
+    if any(
+        hostname == domain or hostname.endswith(f".{domain}")
+        for domain in informational_domains
+    ):
+        return True
+
+    if (
+        hostname == "linkedin.com"
+        or hostname.endswith(".linkedin.com")
+    ) and re.match(r"^/(?:company|in)(?:/|$)", path):
+        return True
+
+    if (
+        hostname in {"bing.com", "www.bing.com", "google.com", "www.google.com"}
+        and re.match(r"^/(?:aclick|url)(?:/|$)", path)
+    ):
+        return True
+
+    if any(
+        hostname == domain or hostname.endswith(f".{domain}")
+        for domain in (
+            "instagram.com",
+            "facebook.com",
+            "x.com",
+            "twitter.com",
+        )
+    ):
+        return True
+
+    if (
+        hostname == "internshala.com"
+        or hostname.endswith(".internshala.com")
+    ) and re.match(r"^/(?:jobs|internships)(?:-|/|$)", path):
+        return True
+
+    informational_title_patterns = (
+        r"\b(?:tutorial|documentation|wiki|course|lesson)\b",
+        r"\bwhat is\b",
+        r"\bintroduction to\b",
+        r"\bquick start\b",
+        r"\binstallation\b",
+        r"\bgetting started\b",
+        r"\bhow to\b",
+    )
+    if any(
+        re.search(pattern, title, re.IGNORECASE)
+        for pattern in informational_title_patterns
+    ):
+        return True
+
+    informational_path_patterns = (
+        r"/wiki(?:/|$)",
+        r"/(?:docs?|documentation|tutorials?|courses?)(?:/|$)",
+        r"/learn(?:/|$)",
+        r"/(?:reviews?|salaries|interviews?)(?:/|$)",
+        r"/(?:blog|blogs|news|articles?|archives?|category|categories|tag|tags)(?:/|$)",
+        r"/(?:sign-?in|log-?in|account)(?:/|$)",
+    )
+    if any(re.search(pattern, path) for pattern in informational_path_patterns):
+        return True
+
+    informational_title_patterns = (
+        r"\b(?:sign|log)\s*in\b",
+        r"\btrack a package\b",
+        r"\bshipping\b",
+        r"\bpharmacy\b",
+        r"\bprocurement\b",
+        r"\bprescription\b",
+    )
+    if any(
+        re.search(pattern, title, re.IGNORECASE)
+        for pattern in informational_title_patterns
+    ):
+        return True
+
+    return (
+        hostname == "github.com"
+        and title.lower().startswith("github -")
+        and len([segment for segment in path.split("/") if segment]) >= 2
     )
 
 
@@ -380,6 +691,11 @@ def _summarize_duplicate(
         "title": existing_result.get("title") or title,
         "company": existing_result.get("company"),
         "location": existing_result.get("location"),
+        "location_query": existing_result.get("location_query"),
+        "location_confirmed": existing_result.get(
+            "location_confirmed",
+            False,
+        ),
         "content": existing_result.get("content", ""),
         "employment_type": existing_result.get("employment_type"),
         "salary": existing_result.get("salary"),
@@ -399,6 +715,107 @@ def _summarize_duplicate(
     }
 
 
+def _store_manual_review_result(
+    collection,
+    *,
+    user_id: str,
+    search_query: str,
+    job_title_query: str,
+    location_query: str,
+    title: str,
+    content: str,
+    result_location: str | None,
+    url: str,
+    verification: dict,
+    max_results_per_user: int,
+) -> tuple[dict, bool]:
+    existing = _find_existing_result(collection, user_id, url)
+    if existing:
+        result = _summarize_duplicate(url, title, existing)
+        result["manual_review_required"] = True
+        return result, False
+
+    parsed_url = urlparse(url)
+    hostname = (parsed_url.hostname or "").lower().rstrip(".")
+    if (
+        parsed_url.scheme.lower() != "https"
+        or not hostname
+        or parsed_url.username
+        or parsed_url.password
+    ):
+        raise ValueError("Only safe HTTPS URLs can be kept for manual review")
+
+    company = _extract_company(title, content)
+    now = datetime.now(timezone.utc)
+    result_data = {
+        "user_id": user_id,
+        "search_query": search_query,
+        "job_title_query": job_title_query,
+        "location_query": location_query,
+        "url": url,
+        "original_url": url,
+        "normalized_url": _normalize_url_for_comparison(url),
+        "title": title,
+        "content": content,
+        "company": company,
+        "location": result_location or _extract_location(content),
+        "location_confirmed": _location_is_confirmed(
+            location=result_location or _extract_location(content),
+            location_query=location_query,
+        ),
+        "employment_type": _extract_employment_type(content),
+        "salary": _extract_salary(content),
+        "experience_required": _extract_experience(content),
+        "source_domain": hostname,
+        "source": "tavily",
+        "result_type": "raw_search_result",
+        "url_verified": False,
+        "job_verified": False,
+        "verification_status": "manual_review_required",
+        "url_verification": verification,
+        "created_at": now,
+    }
+
+    oldest_result = None
+    if collection.count_documents({"user_id": user_id}) >= max_results_per_user:
+        oldest_result = collection.find_one(
+            {"user_id": user_id, "url_verified": False},
+            sort=[("created_at", 1)],
+        )
+        if oldest_result is None:
+            raise RuntimeError("Could not free space for manual-review result")
+        deleted = collection.delete_one({
+            "_id": oldest_result["_id"],
+            "user_id": user_id,
+        })
+        if deleted.deleted_count == 0:
+            raise RuntimeError("Could not free space for manual-review result")
+
+    try:
+        inserted = collection.insert_one(result_data)
+    except Exception:
+        if oldest_result is not None:
+            collection.insert_one(oldest_result)
+        raise
+
+    return {
+        "search_result_id": str(inserted.inserted_id),
+        "url": url,
+        "title": title,
+        "company": company,
+        "location": result_data["location"],
+        "location_query": location_query,
+        "location_confirmed": result_data["location_confirmed"],
+        "content": content,
+        "source_domain": hostname,
+        "url_verified": False,
+        "job_verified": False,
+        "verification_status": "manual_review_required",
+        "manual_review_required": True,
+        "is_duplicate": False,
+    }, True
+
+
 # =========================================================
 # MAIN SEARCH AND STORE FUNCTION
 # =========================================================
@@ -409,11 +826,14 @@ def search_and_store_jobs(
     user_id: str,
     preferences: dict | None = None,
     query: str | None = None,
+    job_title_query: str | None = None,
+    location_query: str | None = None,
     max_job_content_length: int = 100_000,
     max_results_per_user: int = 100,
 ):
     """
-    Search Tavily and store URL-validated raw search results.
+    Search Tavily and store validated results and safe HTTPS URLs
+    that require manual review.
 
     URL validation does not establish that a job is authentic.
     This function does not submit job applications.
@@ -433,6 +853,18 @@ def search_and_store_jobs(
 
     if not isinstance(preferences, dict):
         raise ValueError("preferences must be a dictionary")
+
+    for value, name in (
+        (job_title_query, "job_title_query"),
+        (location_query, "location_query"),
+    ):
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{name} must be a string")
+
+    if job_title_query is not None:
+        job_title_query = job_title_query.strip() or None
+    if location_query is not None:
+        location_query = location_query.strip() or None
 
     if (
         isinstance(max_job_content_length, bool)
@@ -466,9 +898,9 @@ def search_and_store_jobs(
             raise ValueError("Search query cannot be empty")
 
         searches_to_run = [{
-            "query": query,
-            "job_title": "custom",
-            "location": "custom",
+            "query": _expand_job_search_query(query),
+            "job_title": job_title_query or "custom",
+            "location": location_query or "custom",
         }]
 
     else:
@@ -498,7 +930,8 @@ def search_and_store_jobs(
 
                 searches_to_run.append({
                     "query": (
-                        f"{clean_title} jobs in {clean_location}"
+                        f"{_expand_job_search_query(clean_title)} in "
+                        f"{clean_location}"
                     ),
                     "job_title": clean_title,
                     "location": clean_location,
@@ -519,6 +952,9 @@ def search_and_store_jobs(
     total_duplicates = 0
     total_invalid_urls = 0
     total_verification_blocked = 0
+    total_manual_review_saved = 0
+    total_non_job_results = 0
+    total_irrelevant_results = 0
     total_deleted_old_results = 0
     total_search_errors = 0
     total_storage_errors = 0
@@ -531,11 +967,24 @@ def search_and_store_jobs(
         search_query = search_item["query"]
         job_title = search_item["job_title"]
         location = search_item["location"]
+        result_job_title_query = (
+            job_title_query
+            if job_title_query is not None
+            else job_title if job_title != "custom" else None
+        )
+        result_location_query = (
+            location_query
+            if location_query is not None
+            else location if location != "custom" else None
+        )
 
         saved_results = []
         duplicate_results = []
         invalid_url_results = []
         verification_blocked_urls = []
+        manual_review_results = []
+        non_job_result_count = 0
+        irrelevant_result_count = 0
 
         deleted_old_results = 0
         tavily_results = []
@@ -544,7 +993,9 @@ def search_and_store_jobs(
             response = tavily_client.search(
                 query=search_query,
                 search_depth="basic",
-                max_results=10,
+                max_results=20,
+                include_domains=sorted(TRUSTED_JOB_DOMAINS),
+                include_domains_mode="prefer",
             )
 
             if not isinstance(response, dict):
@@ -567,11 +1018,13 @@ def search_and_store_jobs(
                 "duplicate_count": 0,
                 "invalid_url_count": 0,
                 "verification_blocked_count": 0,
+                "non_job_result_count": 0,
                 "deleted_old_results": 0,
                 "saved_results": [],
                 "duplicates": [],
                 "invalid_urls": [],
                 "verification_blocked_urls": [],
+                "manual_review_results": [],
                 "error": "Tavily search failed",
             })
 
@@ -600,6 +1053,24 @@ def search_and_store_jobs(
                 max_length=max_job_content_length,
             )
 
+            reported_location = _safe_text(
+                item.get("location") or item.get("job_location"),
+                max_length=MAX_LOCATION_LENGTH,
+            ) or _extract_location(content)
+            if (
+                (result_job_title_query or result_location_query)
+                and not _matches_requested_criteria(
+                    title=title,
+                    content=content,
+                    location=reported_location,
+                    job_title_query=result_job_title_query,
+                    location_query=result_location_query,
+                )
+            ):
+                irrelevant_result_count += 1
+                total_irrelevant_results += 1
+                continue
+
             raw_url = item.get("url")
 
             if not isinstance(raw_url, str) or not raw_url.strip():
@@ -616,6 +1087,16 @@ def search_and_store_jobs(
                 continue
 
             url = raw_url.strip()
+
+            if _is_non_job_resource(title, url):
+                non_job_result_count += 1
+                total_non_job_results += 1
+                continue
+
+            if _is_listing_page(title, url):
+                non_job_result_count += 1
+                total_non_job_results += 1
+                continue
 
             # ---------------------------------------------
             # 6. Basic URL validation
@@ -675,7 +1156,7 @@ def search_and_store_jobs(
                         "verification_blocked"
                     ) is True
                 ):
-                    verification_blocked_urls.append({
+                    blocked_result = {
                         "url": url,
                         "title": title,
                         "status": "manual_review_required",
@@ -684,9 +1165,32 @@ def search_and_store_jobs(
                             "approve this destination."
                         ),
                         "verification": verification_result,
-                    })
+                    }
+
+                    verification_blocked_urls.append(blocked_result)
 
                     total_verification_blocked += 1
+                    try:
+                        manual_result, was_stored = (
+                            _store_manual_review_result(
+                                job_search_results_collection,
+                                user_id=user_id,
+                                search_query=search_query,
+                                job_title_query=job_title,
+                                location_query=location,
+                                title=title,
+                                content=content,
+                                result_location=reported_location,
+                                url=url,
+                                verification=verification_result,
+                                max_results_per_user=max_results_per_user,
+                            )
+                        )
+                        manual_review_results.append(manual_result)
+                        if was_stored:
+                            total_manual_review_saved += 1
+                    except Exception:
+                        total_storage_errors += 1
 
                 else:
                     invalid_url_results.append({
@@ -715,6 +1219,40 @@ def search_and_store_jobs(
                 continue
 
             if existing_result:
+                if existing_result.get("url_verified") is not True:
+                    now = datetime.now(timezone.utc)
+                    try:
+                        job_search_results_collection.update_one(
+                            {
+                                "_id": existing_result["_id"],
+                                "user_id": user_id,
+                            },
+                            {
+                                "$set": {
+                                    "url_verified": True,
+                                    "job_verified": False,
+                                    "verification_status": (
+                                        "url_validated_job_unverified"
+                                    ),
+                                    "url_verification": verification_result,
+                                    "updated_at": now,
+                                },
+                            },
+                        )
+                    except Exception:
+                        total_storage_errors += 1
+                        continue
+
+                    existing_result.update({
+                        "url_verified": True,
+                        "job_verified": False,
+                        "verification_status": (
+                            "url_validated_job_unverified"
+                        ),
+                        "url_verification": verification_result,
+                        "updated_at": now,
+                    })
+
                 duplicate_summary = _summarize_duplicate(
                     url,
                     title,
@@ -762,8 +1300,10 @@ def search_and_store_jobs(
                 "title": title,
                 "content": content,
                 "company": company,
-                "location": extracted_location or (
-                    location if location != "custom" else None
+                "location": reported_location or extracted_location,
+                "location_confirmed": _location_is_confirmed(
+                    location=reported_location or extracted_location,
+                    location_query=result_location_query,
                 ),
                 "employment_type": employment_type,
                 "salary": salary,
@@ -892,6 +1432,10 @@ def search_and_store_jobs(
                 "title": title,
                 "company": company,
                 "location": search_result_data["location"],
+                "location_query": result_location_query,
+                "location_confirmed": search_result_data[
+                    "location_confirmed"
+                ],
                 "content": content,
                 "employment_type": employment_type,
                 "salary": salary,
@@ -928,6 +1472,8 @@ def search_and_store_jobs(
             "verification_blocked_count": len(
                 verification_blocked_urls
             ),
+            "non_job_result_count": non_job_result_count,
+            "irrelevant_result_count": irrelevant_result_count,
             "deleted_old_results": deleted_old_results,
             "saved_results": saved_results,
             "duplicates": duplicate_results,
@@ -935,6 +1481,7 @@ def search_and_store_jobs(
             "verification_blocked_urls": (
                 verification_blocked_urls
             ),
+            "manual_review_results": manual_review_results,
             "error": None,
         })
 
@@ -951,6 +1498,9 @@ def search_and_store_jobs(
         "total_verification_blocked": (
             total_verification_blocked
         ),
+        "total_manual_review_saved": total_manual_review_saved,
+        "total_non_job_results": total_non_job_results,
+        "total_irrelevant_results": total_irrelevant_results,
         "total_deleted_old_results": (
             total_deleted_old_results
         ),

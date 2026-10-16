@@ -21,6 +21,7 @@ TRUSTED_JOB_DOMAINS = {
     "glassdoor.com",
     "glassdoor.co.in",
     "linkedin.com",
+    "apna.co",
     "remoteok.com",
     "weworkremotely.com",
     "flexjobs.com",
@@ -69,32 +70,6 @@ def _get_trusted_domain(hostname):
             return domain
 
     return None
-
-
-def _is_public_ip(hostname):
-    """Return True if DNS resolves exclusively to globally routable IPs."""
-    try:
-        addresses = socket.getaddrinfo(
-            hostname,
-            443,
-            type=socket.SOCK_STREAM,
-        )
-    except OSError:
-        return False
-
-    if not addresses:
-        return False
-
-    for address in addresses:
-        try:
-            ip = ipaddress.ip_address(address[4][0])
-        except (ValueError, IndexError, TypeError):
-            return False
-
-        if not ip.is_global:
-            return False
-
-    return True
 
 
 def _validate_https_url(url):

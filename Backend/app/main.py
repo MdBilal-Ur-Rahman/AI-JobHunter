@@ -25,8 +25,7 @@ from pydantic import BaseModel
 from typing import List
 
 from bson import ObjectId
-
-from passlib.context import CryptContext
+from bson.errors import InvalidId
 
 from jose import JWTError, jwt
 
@@ -37,6 +36,7 @@ from datetime import (
 )
 
 from uuid import uuid4
+import logging
 
 from tavily import TavilyClient
 
@@ -69,11 +69,30 @@ from app.services.url_verification_service import (
 )
 
 from app.services.tavily_job_search_service import (
+    _is_listing_page,
+    _is_non_job_resource,
+    _matches_requested_criteria,
     search_and_store_jobs
 )
 
 from app.services.application_submission_gate_service import (
     check_submission_gate
+)
+
+from app.services.password_reset_service import (
+    PasswordResetDeliveryError,
+    build_password_reset_url,
+    create_password_reset_token,
+    get_password_reset_mail_settings,
+    hash_password_reset_token,
+    send_password_reset_email,
+)
+
+from app.services.password_service import (
+    MAX_BCRYPT_PASSWORD_BYTES,
+    hash_password,
+    password_within_bcrypt_limit,
+    verify_password,
 )
 
 
@@ -94,6 +113,8 @@ from app.models.application import (
 # =========================================================
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 # =========================================================
@@ -139,16 +160,6 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-)
-
-
-# =========================================================
-# PASSWORD SECURITY
-# =========================================================
-
-pwd_context = CryptContext(
-    schemes=["bcrypt"],
-    deprecated="auto"
 )
 
 
@@ -219,6 +230,8 @@ preferences_collection = db["preferences"]
 revoked_tokens_collection = db["revoked_tokens"]
 
 active_sessions_collection = db["active_sessions"]
+
+password_reset_tokens_collection = db["password_reset_tokens"]
 
 
 # =========================================================
@@ -394,6 +407,23 @@ active_sessions_collection.create_index(
     unique=True
 )
 
+password_reset_tokens_collection.create_index(
+    "token_hash",
+    unique=True
+)
+
+password_reset_tokens_collection.create_index(
+    "expires_at",
+    expireAfterSeconds=0
+)
+
+password_reset_tokens_collection.create_index(
+    [
+        ("user_id", 1),
+        ("created_at", -1)
+    ]
+)
+
 
 # =========================================================
 # LIMITS
@@ -423,6 +453,21 @@ MAX_APPLICATIONS_PER_USER = 100
 
 def get_user_id(current_user: dict) -> str:
     return str(current_user["_id"])
+
+
+def ensure_application_is_individual_job(application: dict) -> None:
+    application_url = application.get("application_url", "")
+    if (
+        _is_listing_page("", application_url)
+        or _is_non_job_resource("", application_url)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This application points to a profile, company, or "
+                "job-search page, not an individual job posting."
+            ),
+        )
 
 
 def is_valid_object_id(value: str) -> bool:
@@ -586,6 +631,20 @@ class LoginUser(BaseModel):
     password: str
 
 
+class ProfileUpdate(BaseModel):
+    name: str
+    email: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
+
 class UserPreferences(BaseModel):
     job_titles: List[str]
     locations: List[str]
@@ -673,22 +732,6 @@ def get_my_stored_jobs(
 ):
     user_id = get_user_id(current_user)
 
-    print("CURRENT USER ID:", user_id)
-
-    print(
-        "RAW SEARCH RESULTS:",
-        job_search_results_collection.count_documents({
-            "user_id": user_id
-        })
-    )
-
-    print(
-        "STORED JOBS:",
-        jobs_collection.count_documents({
-            "user_id": user_id
-        })
-    )
-
     stored_jobs = list(
         jobs_collection.find({
             "user_id": user_id
@@ -698,6 +741,14 @@ def get_my_stored_jobs(
     jobs = []
 
     for job in stored_jobs:
+        job_url = job.get("application_url", "")
+
+        if (
+            _is_listing_page(job.get("title", ""), job_url)
+            or _is_non_job_resource(job.get("title", ""), job_url)
+        ):
+            continue
+
         jobs.append({
             "job_id": str(job["_id"]),
             "title": job.get("title", "Not specified"),
@@ -790,6 +841,26 @@ def search_jobs(
 # TAVILY SEARCH RESULTS - GET MY SAVED RESULTS
 # =========================================================
 
+def _is_visible_search_result(result: dict) -> bool:
+    title = result.get("title", "")
+    url = result.get("url", "")
+    if _is_listing_page(title, url) or _is_non_job_resource(title, url):
+        return False
+
+    job_title_query = result.get("job_title_query")
+    location_query = result.get("location_query")
+    if job_title_query == "custom" or location_query == "custom":
+        return False
+
+    return _matches_requested_criteria(
+        title=title,
+        content=result.get("content", ""),
+        location=result.get("location"),
+        job_title_query=job_title_query,
+        location_query=location_query,
+    )
+
+
 @app.get("/jobs/search-results")
 def get_my_search_results(
     current_user: dict = Depends(get_current_user)
@@ -804,6 +875,8 @@ def get_my_search_results(
             -1
         )
     )
+
+    results = [result for result in results if _is_visible_search_result(result)]
 
     for result in results:
         result["_id"] = str(result["_id"])
@@ -850,15 +923,27 @@ def normalize_and_store_job(
         "url"
     ) or ""
 
-    job_content = search_result.get(
-        "content"
-    ) or ""
+    if _is_listing_page(job_title, job_url):
+        return {
+            "message": (
+                "This is a job-search results page, not an individual "
+                "job posting. Open the result and save a specific job."
+            ),
+            "search_result_id": search_result_id,
+            "is_individual_job": False,
+            "stored": False
+        }
 
-    if not job_content:
-        raise HTTPException(
-            status_code=400,
-            detail="Search result has no content to normalize"
-        )
+    if _is_non_job_resource(job_title, job_url):
+        return {
+            "message": (
+                "This link is a company review or informational page, "
+                "not a job posting, so it was not saved."
+            ),
+            "search_result_id": search_result_id,
+            "is_individual_job": False,
+            "stored": False
+        }
 
     existing_job = jobs_collection.find_one({
         "user_id": user_id,
@@ -884,39 +969,8 @@ def normalize_and_store_job(
         )
 
     try:
-        normalized_job = normalize_job(
-            job_title=job_title,
-            job_url=job_url,
-            job_content=job_content
-        )
-
-    except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Job normalization failed: {str(error)}"
-        )
-
-    if not normalized_job.is_individual_job:
-        return {
-            "message": "Search result is not an individual job",
-            "search_result_id": search_result_id,
-            "is_individual_job": False
-        }
-
-    application_url = normalized_job.application_url
-
-    if not application_url or application_url == "Not specified":
-        return {
-            "message": "Job does not have a valid application URL",
-            "search_result_id": search_result_id,
-            "stored": False,
-            "url_verified": False,
-            "normalized_job": normalized_job.model_dump()
-        }
-
-    try:
         verification_result = verify_application_url(
-            application_url
+            job_url
         )
 
     except Exception as error:
@@ -927,28 +981,30 @@ def normalize_and_store_job(
 
     if not verification_result.get("valid", False):
         return {
-            "message": "Application URL could not be verified",
+            "message": (
+                "This job URL could not be verified against a recognized "
+                "job-site domain, so it was not saved."
+            ),
             "search_result_id": search_result_id,
             "stored": False,
-            "url_verified": False,
-            "verification": verification_result,
-            "normalized_job": normalized_job.model_dump()
+            "url_verified": False
         }
 
     now = datetime.now(timezone.utc)
 
     stored_job = StoredJob(
         user_id=user_id,
-        title=normalized_job.title,
-        company=normalized_job.company,
-        location=normalized_job.location,
-        employment_type=normalized_job.employment_type,
-        experience_required=normalized_job.experience_required,
-        required_skills=normalized_job.required_skills,
-        preferred_skills=normalized_job.preferred_skills,
-        education=normalized_job.education,
-        salary=normalized_job.salary,
-        application_url=application_url,
+        title=job_title,
+        company=search_result.get("company") or "Not specified",
+        location=search_result.get("location") or "Not specified",
+        employment_type=(
+            search_result.get("employment_type") or "Not specified"
+        ),
+        experience_required=(
+            search_result.get("experience_required") or "Not specified"
+        ),
+        salary=search_result.get("salary") or "Not specified",
+        application_url=job_url,
         source="tavily",
         source_search_result_id=search_result_id
     )
@@ -985,7 +1041,10 @@ def normalize_and_store_job(
         )
 
     return {
-        "message": "Job normalized and stored successfully",
+        "message": (
+            "Job posting saved. Employer and job details still need "
+            "your review."
+        ),
 
         "job_id": str(
             insert_result.inserted_id
@@ -996,6 +1055,7 @@ def normalize_and_store_job(
         "is_individual_job": True,
 
         "url_verified": True,
+        "stored": True,
 
         "job": stored_job.model_dump()
     }
@@ -1419,8 +1479,6 @@ def match_job_with_resume(
 
         if hasattr(result, "model_dump"):
             match_result = result.model_dump()
-        elif hasattr(result, "dict"):
-            match_result = result.dict()
         else:
             match_result = dict(result)
 
@@ -1746,6 +1804,15 @@ def register_user(user: User):
             detail="Password cannot be empty"
         )
 
+    if not password_within_bcrypt_limit(user.password):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Password must be no more than "
+                f"{MAX_BCRYPT_PASSWORD_BYTES} UTF-8 bytes."
+            )
+        )
+
     existing_user = users_collection.find_one({
         "email": email
     })
@@ -1759,9 +1826,7 @@ def register_user(user: User):
             )
         )
 
-    hashed_password = pwd_context.hash(
-        user.password
-    )
+    hashed_password = hash_password(user.password)
 
     user_data = {
         "name": name,
@@ -1788,6 +1853,149 @@ def register_user(user: User):
     return {
         "message": "User registered successfully",
         "user_id": str(result.inserted_id)
+    }
+
+
+@app.post("/users/forgot-password")
+def forgot_password(request: ForgotPasswordRequest):
+    email = request.email.strip().lower()
+
+    try:
+        mail_settings = get_password_reset_mail_settings()
+    except PasswordResetDeliveryError as exc:
+        logger.error("Password reset email configuration is invalid: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Password reset email is temporarily unavailable."
+        ) from exc
+
+    response = {
+        "message": (
+            "If an account exists for that email, a password reset link "
+            "will be sent."
+        )
+    }
+    user = users_collection.find_one({"email": email})
+
+    if not user:
+        return response
+
+    now = datetime.now(timezone.utc)
+    cooldown_start = now - timedelta(minutes=1)
+    user_id = str(user["_id"])
+    recent_request = password_reset_tokens_collection.find_one({
+        "user_id": user_id,
+        "created_at": {"$gte": cooldown_start}
+    })
+
+    if recent_request:
+        return response
+
+    token, token_hash = create_password_reset_token()
+    expires_at = now + timedelta(minutes=30)
+    inserted_token = password_reset_tokens_collection.insert_one({
+        "user_id": user_id,
+        "token_hash": token_hash,
+        "created_at": now,
+        "expires_at": expires_at
+    })
+
+    reset_url = build_password_reset_url(
+        token,
+        mail_settings.frontend_base_url
+    )
+
+    try:
+        send_password_reset_email(
+            email,
+            reset_url,
+            mail_settings
+        )
+    except PasswordResetDeliveryError as exc:
+        password_reset_tokens_collection.delete_one({
+            "_id": inserted_token.inserted_id
+        })
+        logger.exception("Could not deliver a password reset email.")
+        raise HTTPException(
+            status_code=503,
+            detail="Could not send the password reset email. Please try again."
+        ) from exc
+
+    password_reset_tokens_collection.delete_many({
+        "user_id": user_id,
+        "_id": {"$ne": inserted_token.inserted_id}
+    })
+
+    return response
+
+
+@app.post("/users/reset-password")
+def reset_password(request: ResetPasswordRequest):
+    if not request.token or len(request.token) > 256:
+        raise HTTPException(
+            status_code=400,
+            detail="This password reset link is invalid or has expired."
+        )
+
+    if len(request.new_password) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 8 characters long."
+        )
+
+    if not password_within_bcrypt_limit(request.new_password):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Password must be no more than "
+                f"{MAX_BCRYPT_PASSWORD_BYTES} UTF-8 bytes."
+            )
+        )
+
+    password_hash = hash_password(request.new_password)
+    now = datetime.now(timezone.utc)
+    reset_token = password_reset_tokens_collection.find_one_and_delete({
+        "token_hash": hash_password_reset_token(request.token),
+        "expires_at": {"$gt": now}
+    })
+
+    if not reset_token:
+        raise HTTPException(
+            status_code=400,
+            detail="This password reset link is invalid or has expired."
+        )
+
+    user_id = reset_token["user_id"]
+    try:
+        object_user_id = ObjectId(user_id)
+    except InvalidId as exc:
+        logger.error("Password reset token contains an invalid user ID.")
+        raise HTTPException(
+            status_code=400,
+            detail="This password reset link is invalid or has expired."
+        ) from exc
+
+    updated_user = users_collection.update_one(
+        {"_id": object_user_id},
+        {
+            "$set": {
+                "password": password_hash,
+                "updated_at": now
+            }
+        }
+    )
+
+    if updated_user.matched_count == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="This password reset link is invalid or has expired."
+        )
+
+    active_sessions_collection.delete_many({"user_id": user_id})
+    password_reset_tokens_collection.delete_many({"user_id": user_id})
+
+    return {
+        "message": "Password reset successfully. Please log in again."
     }
 
 
@@ -1825,14 +2033,30 @@ def login_user(user: LoginUser):
             )
         )
 
+    if not password_within_bcrypt_limit(password):
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Email ya password galat hai. "
+                "Please check karke dobara try karein."
+            )
+        )
+
     try:
-        password_correct = pwd_context.verify(
+        password_correct = verify_password(
             password,
             existing_user["password"]
         )
 
-    except Exception:
-        password_correct = False
+    except Exception as exc:
+        logger.exception("Password verification failed for a stored user hash.")
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Unable to verify credentials right now. "
+                "Please try again later."
+            )
+        ) from exc
 
     if not password_correct:
         raise HTTPException(
@@ -2049,6 +2273,70 @@ def get_my_profile(
     }
 
 
+@app.put("/users/me")
+def update_my_profile(
+    profile: ProfileUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    name = profile.name.strip()
+    email = profile.email.strip().lower()
+
+    if not name:
+        raise HTTPException(
+            status_code=400,
+            detail="Name cannot be empty."
+        )
+
+    if len(name) > 120:
+        raise HTTPException(
+            status_code=400,
+            detail="Name must be no more than 120 characters."
+        )
+
+    if not email or "@" not in email:
+        raise HTTPException(
+            status_code=400,
+            detail="Enter a valid email address."
+        )
+
+    if len(email) > 254:
+        raise HTTPException(
+            status_code=400,
+            detail="Email must be no more than 254 characters."
+        )
+
+    user_id = get_user_id(current_user)
+    try:
+        update_result = users_collection.update_one(
+            {"_id": current_user["_id"]},
+            {
+                "$set": {
+                    "name": name,
+                    "email": email,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            }
+        )
+    except DuplicateKeyError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="An account with this email already exists."
+        ) from exc
+
+    if update_result.matched_count == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="User account not found."
+        )
+
+    return {
+        "message": "Profile updated successfully.",
+        "user_id": user_id,
+        "name": name,
+        "email": email,
+    }
+
+
 # =========================================================
 # RESUME - UPLOAD
 # =========================================================
@@ -2129,10 +2417,12 @@ async def upload_resume(
 # RESUME - TEXT EXTRACTION TEST
 # =========================================================
 
-@app.post("/resumes/text-extraction-test")
+@app.post(
+    "/resumes/text-extraction-test",
+    dependencies=[Depends(get_current_user)],
+)
 async def resume_text_extraction_test(
     file: UploadFile = File(...),
-    current_user: dict = Depends(get_current_user)
 ):
     if file.content_type not in ALLOWED_RESUME_TYPES:
         raise HTTPException(
@@ -2628,6 +2918,8 @@ def update_preferences(
 @app.get("/jobs/search/tavily")
 def search_jobs_with_tavily(
     query: str | None = None,
+    job_title: str | None = None,
+    location: str | None = None,
     current_user: dict = Depends(get_current_user)
 ):
     user_id = get_user_id(current_user)
@@ -2643,7 +2935,6 @@ def search_jobs_with_tavily(
         )
 
     try:
-        # Step 1: Search Tavily and store raw search results.
         result = search_and_store_jobs(
             tavily_client=tavily_client,
             job_search_results_collection=(
@@ -2652,218 +2943,15 @@ def search_jobs_with_tavily(
             user_id=user_id,
             preferences=preferences,
             query=query,
+            job_title_query=job_title,
+            location_query=location,
             max_job_content_length=MAX_JOB_CONTENT_LENGTH,
             max_results_per_user=MAX_JOB_SEARCH_RESULTS_PER_USER
         )
 
-        raw_results = result.get("searches", [])
-
-        normalized_saved = 0
-        normalization_skipped = 0
-        normalization_errors = []
-        normalization_skips = []
-        current_job_count = jobs_collection.count_documents({
-            "user_id": user_id
-        })
-
-        def record_normalization_skip(search_result_id, reason):
-            nonlocal normalization_skipped
-            normalization_skipped += 1
-            normalization_skips.append({
-                "search_result_id": search_result_id,
-                "reason": reason
-            })
-
-        # Step 2: Normalize eligible results into jobs_collection.
-        for search in raw_results:
-            saved_results = search.get("saved_results", [])
-
-            for search_result in saved_results:
-                search_result_id = search_result.get(
-                    "search_result_id"
-                )
-
-                if not search_result_id:
-                    record_normalization_skip(
-                        None,
-                        "Missing search result ID"
-                    )
-                    continue
-
-                if not ObjectId.is_valid(search_result_id):
-                    record_normalization_skip(
-                        search_result_id,
-                        "Invalid search result ID"
-                    )
-                    continue
-
-                # The raw search result must belong to this user.
-                raw_job = job_search_results_collection.find_one({
-                    "_id": ObjectId(search_result_id),
-                    "user_id": user_id
-                })
-
-                if not raw_job:
-                    record_normalization_skip(
-                        search_result_id,
-                        "Raw search result not found for this user"
-                    )
-                    continue
-
-                # Avoid creating the same normalized job twice.
-                existing_job = jobs_collection.find_one({
-                    "user_id": user_id,
-                    "source_search_result_id": search_result_id
-                })
-
-                if existing_job:
-                    record_normalization_skip(
-                        search_result_id,
-                        "Job is already normalized and stored"
-                    )
-                    continue
-
-                if current_job_count >= MAX_JOBS_PER_USER:
-                    record_normalization_skip(
-                        search_result_id,
-                        "Maximum saved jobs limit reached"
-                    )
-                    continue
-
-                # A duplicate search result can point to an existing
-                # raw record. We still normalize only if it has not
-                # already been normalized for this user.
-                job_url = raw_job.get("url", "")
-                job_title = raw_job.get("title", "")
-                job_content = raw_job.get("content", "")
-
-                if not job_url or not job_title or not job_content:
-                    record_normalization_skip(
-                        search_result_id,
-                        "Raw result is missing title, URL, or content"
-                    )
-                    continue
-
-                try:
-                    normalized = normalize_job(
-                        job_title=job_title,
-                        job_url=job_url,
-                        job_content=job_content[
-                            :MAX_JOB_CONTENT_LENGTH
-                        ]
-                    )
-
-                    normalized_data = normalized.model_dump()
-
-                    # Do not save general search/listing pages as jobs.
-                    if not normalized_data.get(
-                        "is_individual_job",
-                        False
-                    ):
-                        record_normalization_skip(
-                            search_result_id,
-                            "Result is not an individual job posting"
-                        )
-                        continue
-
-                    application_url = normalized_data.get(
-                        "application_url"
-                    )
-
-                    if (
-                        not application_url
-                        or application_url == "Not specified"
-                    ):
-                        application_url = job_url
-
-                    # Verify the application URL before storing the job.
-                    verification = verify_application_url(
-                        application_url
-                    )
-
-                    if not verification.get("valid", False):
-                        record_normalization_skip(
-                            search_result_id,
-                            "Application URL could not be verified"
-                        )
-                        continue
-
-                    now = datetime.now(timezone.utc)
-
-                    stored_job = StoredJob(
-                        user_id=user_id,
-                        title=normalized_data.get(
-                            "title", "Not specified"
-                        ),
-                        company=normalized_data.get(
-                            "company", "Not specified"
-                        ),
-                        location=normalized_data.get(
-                            "location", "Not specified"
-                        ),
-                        employment_type=normalized_data.get(
-                            "employment_type", "Not specified"
-                        ),
-                        experience_required=normalized_data.get(
-                            "experience_required", "Not specified"
-                        ),
-                        required_skills=normalized_data.get(
-                            "required_skills", []
-                        ),
-                        preferred_skills=normalized_data.get(
-                            "preferred_skills", []
-                        ),
-                        education=normalized_data.get(
-                            "education", "Not specified"
-                        ),
-                        salary=normalized_data.get(
-                            "salary", "Not specified"
-                        ),
-                        application_url=application_url,
-                        source="tavily",
-                        source_search_result_id=search_result_id
-                    )
-
-                    job_data = stored_job.model_dump()
-
-                    job_data["created_at"] = now
-                    job_data["updated_at"] = now
-                    job_data["url_verified"] = True
-                    job_data["application_url_verified"] = True
-                    job_data["application_url_verification"] = (
-                        verification
-                    )
-                    job_data["job_verified"] = False
-
-                    jobs_collection.insert_one(job_data)
-
-                    normalized_saved += 1
-                    current_job_count += 1
-
-                except DuplicateKeyError:
-                    # A concurrent request may have inserted the job.
-                    record_normalization_skip(
-                        search_result_id,
-                        "Job was inserted by a concurrent request"
-                    )
-
-                except Exception as error:
-                    # Keep processing the remaining results.
-                    normalization_errors.append({
-                        "search_result_id": search_result_id,
-                        "error": str(error)
-                    })
-
-        # Step 3: Return search and normalized-save counts.
-        result["normalization"] = {
-            "newly_saved_jobs": normalized_saved,
-            "skipped_jobs": normalization_skipped,
-            "skipped_results": normalization_skips,
-            "errors": normalization_errors
-        }
-
         result["message"] = (
-            "Tavily search completed and eligible jobs processed"
+            "Search results are ready. Save individual job postings "
+            "to add them to Saved Jobs."
         )
 
         return result
@@ -3141,6 +3229,18 @@ def get_applications(
                 "user_id": user_id
             })
 
+        application_url = (
+            application.get("application_url")
+            or (job or {}).get("application_url", "")
+        )
+        job_title = (job or {}).get("title", "")
+
+        if (
+            _is_listing_page(job_title, application_url)
+            or _is_non_job_resource(job_title, application_url)
+        ):
+            continue
+
         results.append({
             "application_id": str(
                 application["_id"]
@@ -3229,6 +3329,40 @@ def get_applications(
 
 
 # =========================================================
+# APPLICATIONS - DELETE
+# =========================================================
+
+@app.delete("/applications/{application_id}")
+def delete_application(
+    application_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    user_id = get_user_id(current_user)
+
+    if not ObjectId.is_valid(application_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid application ID"
+        )
+
+    result = applications_collection.delete_one({
+        "_id": ObjectId(application_id),
+        "user_id": user_id
+    })
+
+    if result.deleted_count == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="Application not found"
+        )
+
+    return {
+        "message": "Application deleted successfully",
+        "application_id": application_id
+    }
+
+
+# =========================================================
 # APPLICATIONS - PREPARE
 # =========================================================
 
@@ -3260,6 +3394,20 @@ def prepare_application(
         raise HTTPException(
             status_code=404,
             detail="Job not found"
+        )
+
+    job_url = job.get("application_url", "")
+    if (
+        _is_listing_page(job.get("title", ""), job_url)
+        or _is_non_job_resource(job.get("title", ""), job_url)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This saved item is a company or job-search page, not an "
+                "individual job posting, so it cannot be added to the "
+                "application tracker."
+            )
         )
 
     resume = resumes_collection.find_one({
@@ -3488,6 +3636,8 @@ def approve_application(
             detail="Application not found"
         )
 
+    ensure_application_is_individual_job(application)
+
     if not application.get(
         "requires_user_review",
         True
@@ -3559,6 +3709,8 @@ def application_submission_gate(
             status_code=404,
             detail="Application not found"
         )
+
+    ensure_application_is_individual_job(application)
 
     try:
         gate_result = check_submission_gate(
@@ -3758,6 +3910,8 @@ def open_application(
             detail="Application not found"
         )
 
+    ensure_application_is_individual_job(application)
+
     if not application.get(
         "approved",
         False
@@ -3891,6 +4045,8 @@ def inspect_application(
             status_code=404,
             detail="Application not found"
         )
+
+    ensure_application_is_individual_job(application)
 
     application_url = application.get(
         "application_url"
@@ -4036,6 +4192,14 @@ def map_application_fields_for_application(
             status_code=404,
             detail="Job not found"
         )
+
+    ensure_application_is_individual_job({
+        **application,
+        "application_url": job.get(
+            "application_url",
+            application.get("application_url", ""),
+        ),
+    })
 
     resume = resumes_collection.find_one({
         "_id": ObjectId(resume_id),
@@ -4212,25 +4376,67 @@ def get_dashboard_summary(
 ):
     user_id = get_user_id(current_user)
 
-    # Number of raw search results stored for this user.
-    jobs_found = job_search_results_collection.count_documents({
-        "user_id": user_id
-    })
+    search_results = job_search_results_collection.find(
+        {"user_id": user_id},
+        {
+            "title": 1,
+            "url": 1,
+            "content": 1,
+            "location": 1,
+            "job_title_query": 1,
+            "location_query": 1,
+        },
+    )
+    jobs_found = sum(
+        _is_visible_search_result(result)
+        for result in search_results
+    )
 
-    # Number of normalized jobs available to the user.
-    saved_jobs = jobs_collection.count_documents({
-        "user_id": user_id
-    })
+    stored_jobs = list(jobs_collection.find(
+        {"user_id": user_id},
+        {"title": 1, "application_url": 1},
+    ))
+    jobs_by_id = {
+        str(job["_id"]): job
+        for job in stored_jobs
+    }
+    saved_jobs = sum(
+        not (
+            _is_listing_page(
+                job.get("title", ""),
+                job.get("application_url", ""),
+            )
+            or _is_non_job_resource(
+                job.get("title", ""),
+                job.get("application_url", ""),
+            )
+        )
+        for job in stored_jobs
+    )
 
     # Number of stored resume-job matches.
     matched_jobs = job_matches_collection.count_documents({
         "user_id": user_id
     })
 
-    # Number of tracked applications.
-    applications = applications_collection.count_documents({
-        "user_id": user_id
-    })
+    tracked_applications = applications_collection.find(
+        {"user_id": user_id},
+        {"job_id": 1, "application_url": 1},
+    )
+    applications = 0
+    for application in tracked_applications:
+        job = jobs_by_id.get(application.get("job_id"))
+        application_url = (
+            application.get("application_url")
+            or (job or {}).get("application_url", "")
+        )
+        job_title = (job or {}).get("title", "")
+        if (
+            _is_listing_page(job_title, application_url)
+            or _is_non_job_resource(job_title, application_url)
+        ):
+            continue
+        applications += 1
 
     return {
         "jobs_found": jobs_found,

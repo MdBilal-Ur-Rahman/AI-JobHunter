@@ -3,6 +3,7 @@ import Header from "../components/Header"
 import JobSearch from "../components/JobSearch"
 import DashboardCards from "../components/DashboardCards"
 import RecentApplications from "../components/RecentApplications"
+import ResumeMatchHistory from "../components/ResumeMatchHistory"
 import SavedJobs from "../components/SavedJobs"
 
 function Dashboard() {
@@ -14,8 +15,8 @@ function Dashboard() {
         <Header />
 
         <main className="p-4 sm:p-6 lg:p-8">
-          <div className="mx-auto w-full max-w-7xl">
-            <div className="mb-6">
+          <div className="mx-auto flex w-full max-w-7xl flex-col gap-6">
+            <div>
               <h1 className="text-2xl font-bold text-gray-900 dark:text-white sm:text-3xl">
                 Dashboard
               </h1>
@@ -28,6 +29,7 @@ function Dashboard() {
             <JobSearch />
 
             <DashboardCards />
+            <ResumeMatchHistory />
             <SavedJobs />
 
             <RecentApplications />

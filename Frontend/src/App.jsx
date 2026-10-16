@@ -8,7 +8,10 @@ import {
 import Dashboard from "./pages/Dashboard"
 import Applications from "./pages/Applications"
 import Login from "./pages/Login"
+import ForgotPassword from "./pages/ForgotPassword"
+import ResetPassword from "./pages/ResetPassword"
 import Preferences from "./pages/Preferences"
+import Profile from "./pages/Profile"
 import Register from "./pages/Register"
 import Resume from "./pages/Resume"
 import ProtectedRoute from "./components/ProtectedRoute"
@@ -34,6 +37,16 @@ function App() {
               <Register />
             </PublicRoute>
           }
+        />
+
+        <Route
+          path="/forgot-password"
+          element={<ForgotPassword />}
+        />
+
+        <Route
+          path="/reset-password"
+          element={<ResetPassword />}
         />
 
         <Route
@@ -77,6 +90,15 @@ function App() {
           element={
             <ProtectedRoute>
               <Preferences />
+            </ProtectedRoute>
+          }
+        />
+
+        <Route
+          path="/profile"
+          element={
+            <ProtectedRoute>
+              <Profile />
             </ProtectedRoute>
           }
         />

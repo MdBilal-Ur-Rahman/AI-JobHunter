@@ -1,5 +1,5 @@
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { NavLink } from "react-router-dom"
 
 function Sidebar() {
@@ -11,16 +11,28 @@ function Sidebar() {
     { label: "Resume", path: "/resume" },
     { label: "Applications", path: "/applications" },
     { label: "Preferences", path: "/preferences" },
+    { label: "Profile", path: "/profile" },
   ]
 
   function handleNavigation() {
     setIsOpen(false)
   }
 
+  useEffect(() => {
+    function handleKeyDown(event) {
+      if (event.key === "Escape") {
+        setIsOpen(false)
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown)
+    return () => window.removeEventListener("keydown", handleKeyDown)
+  }, [])
+
   return (
     <>
       {/* Mobile Header */}
-      <div className="flex items-center justify-between border-b border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-900 md:hidden">
+      <div className="sticky top-0 z-40 flex items-center justify-between border-b border-gray-200 bg-white/95 p-4 backdrop-blur dark:border-gray-700 dark:bg-gray-900/95 md:hidden">
         <div>
           <h1 className="text-xl font-bold text-gray-900 dark:text-white">
             AI JobHunter
@@ -45,18 +57,49 @@ function Sidebar() {
         </button>
       </div>
 
+      {isOpen && (
+        <button
+          type="button"
+          onClick={handleNavigation}
+          className="fixed inset-0 z-40 bg-gray-950/50 md:hidden"
+          aria-label="Close navigation menu"
+        />
+      )}
+
       {/* Sidebar */}
       <aside
         id="sidebar-navigation"
         className={`
-          ${isOpen ? "block" : "hidden"}
-          w-full border-b border-gray-200 bg-white
+          ${isOpen
+            ? "fixed inset-y-0 left-0 z-50 block w-72 max-w-[calc(100vw-2rem)] overflow-y-auto"
+            : "hidden"
+          }
+          border-b border-gray-200 bg-white shadow-xl
           dark:border-gray-700 dark:bg-gray-900
           md:fixed md:inset-y-0 md:left-0 md:z-40
-          md:block md:h-screen md:w-64 md:overflow-y-auto
-          md:border-b-0 md:border-r
+          md:block md:h-dvh md:w-64 md:overflow-y-auto
+          md:border-b-0 md:border-r md:shadow-none
         `}
       >
+        <div className="flex items-center justify-between border-b border-gray-200 px-5 py-4 dark:border-gray-700 md:hidden">
+          <div>
+            <h2 className="font-bold text-gray-900 dark:text-white">
+              Navigation
+            </h2>
+            <p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
+              Your workspace
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={handleNavigation}
+            className="rounded-lg p-2 text-gray-600 transition hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-gray-300 dark:hover:bg-gray-800"
+            aria-label="Close navigation menu"
+          >
+            ✕
+          </button>
+        </div>
+
         {/* Desktop Logo */}
         <div className="hidden p-6 md:block">
           <h1 className="text-2xl font-bold text-gray-900 dark:text-white">

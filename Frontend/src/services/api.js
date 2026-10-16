@@ -66,6 +66,7 @@ async function apiRequest(
     body,
     token,
     headers = {},
+    timeoutMs,
     ...options
   } = {}
 ) {
@@ -89,22 +90,51 @@ async function apiRequest(
     requestHeaders["Content-Type"] = "application/json"
   }
 
-  const response = await fetch(
-    `${API_BASE_URL}${endpoint}`,
-    {
-      method,
-      headers: requestHeaders,
-      body:
-        body === undefined
-          ? undefined
-          : isFormData
-            ? body
-            : JSON.stringify(body),
-      ...options,
-    }
-  )
+  const timeoutController =
+    Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? new AbortController()
+      : null
+  const timeoutId = timeoutController
+    ? window.setTimeout(() => timeoutController.abort(), timeoutMs)
+    : null
 
-  const data = await getResponseData(response)
+  let response
+  let data
+
+  try {
+    response = await fetch(
+      `${API_BASE_URL}${endpoint}`,
+      {
+        method,
+        headers: requestHeaders,
+        body:
+          body === undefined
+            ? undefined
+            : isFormData
+              ? body
+              : JSON.stringify(body),
+        ...options,
+        ...(timeoutController
+          ? { signal: timeoutController.signal }
+          : {}),
+      }
+    )
+
+    data = await getResponseData(response)
+  } catch (error) {
+    if (timeoutController?.signal.aborted) {
+      throw createApiError(
+        "This AI request timed out. Please try again.",
+        408
+      )
+    }
+
+    throw error
+  } finally {
+    if (timeoutId !== null) {
+      window.clearTimeout(timeoutId)
+    }
+  }
 
   if (!response.ok) {
     const message = getApiErrorMessage(
@@ -158,6 +188,25 @@ export async function loginUser(email, password) {
   })
 }
 
+export async function requestPasswordReset(email) {
+  return apiRequest("/users/forgot-password", {
+    method: "POST",
+    body: {
+      email: email.trim().toLowerCase(),
+    },
+  })
+}
+
+export async function resetPassword(token, newPassword) {
+  return apiRequest("/users/reset-password", {
+    method: "POST",
+    body: {
+      token,
+      new_password: newPassword,
+    },
+  })
+}
+
 export async function logoutUser(token) {
   if (!token) {
     return {
@@ -174,6 +223,17 @@ export async function logoutUser(token) {
 export async function getCurrentUser(token) {
   return apiRequest("/users/me", {
     method: "GET",
+    token,
+  })
+}
+
+export async function updateCurrentUser(profile, token) {
+  return apiRequest("/users/me", {
+    method: "PUT",
+    body: {
+      name: profile.name.trim(),
+      email: profile.email.trim().toLowerCase(),
+    },
     token,
   })
 }
@@ -278,6 +338,14 @@ export async function searchJobs(jobTitle, location, token) {
     query: queryParts.join(" "),
   })
 
+  if (cleanJobTitle) {
+    params.set("job_title", cleanJobTitle)
+  }
+
+  if (cleanLocation) {
+    params.set("location", cleanLocation)
+  }
+
   return apiRequest(
     `/jobs/search/tavily?${params.toString()}`,
     {
@@ -381,6 +449,92 @@ export async function normalizeAndStoreJob(
   )
 }
 
+export async function saveJobAndTrack(searchResultId, token) {
+  const saveResponse = await normalizeAndStoreJob(searchResultId, token)
+  const jobId = saveResponse?.job_id
+
+  if (
+    saveResponse?.is_individual_job === false ||
+    (saveResponse?.stored === false && !jobId)
+  ) {
+    return {
+      saved: false,
+      tracked: false,
+      saveResponse,
+    }
+  }
+
+  if (!jobId) {
+    return {
+      saved: true,
+      tracked: false,
+      saveResponse,
+      trackingMessage:
+        "Job saved, but the server did not return its ID for the tracker.",
+    }
+  }
+
+  let resumes
+  try {
+    resumes = await getMyResumes(token)
+  } catch (error) {
+    return {
+      saved: true,
+      tracked: false,
+      saveResponse,
+      trackingError: error,
+    }
+  }
+
+  const resumeList = Array.isArray(resumes)
+    ? resumes
+    : Array.isArray(resumes?.resumes)
+      ? resumes.resumes
+      : Array.isArray(resumes?.data)
+        ? resumes.data
+        : Array.isArray(resumes?.items)
+          ? resumes.items
+          : Array.isArray(resumes?.results)
+            ? resumes.results
+            : []
+  const verifiedResume = resumeList.find(
+    (resume) => resume?.resume_verified === true
+  )
+  const resumeId =
+    verifiedResume?.resume_id || verifiedResume?._id || verifiedResume?.id
+
+  if (!resumeId) {
+    return {
+      saved: true,
+      tracked: false,
+      saveResponse,
+      trackingMessage:
+        "Job saved, but no verified resume is available to add it to the tracker.",
+    }
+  }
+
+  try {
+    const trackingResponse = await prepareApplication(
+      jobId,
+      resumeId,
+      token
+    )
+    return {
+      saved: true,
+      tracked: true,
+      saveResponse,
+      trackingResponse,
+    }
+  } catch (error) {
+    return {
+      saved: true,
+      tracked: false,
+      saveResponse,
+      trackingError: error,
+    }
+  }
+}
+
 export async function normalizeAndStoreJobById(
   searchResultId,
   token
@@ -439,6 +593,7 @@ export async function matchJobWithResume(
     {
       method: "GET",
       token,
+      timeoutMs: 7 * 60 * 1000,
     }
   )
 }
@@ -455,6 +610,7 @@ export async function tailorJobResume(
     {
       method: "POST",
       token,
+      timeoutMs: 7 * 60 * 1000,
     }
   )
 }
@@ -485,6 +641,23 @@ export async function prepareApplication(
 
 export async function getApplications(token) {
   return apiRequest("/applications", {
+    method: "GET",
+    token,
+  })
+}
+
+export async function deleteApplication(applicationId, token) {
+  return apiRequest(
+    `/applications/${encodeURIComponent(applicationId)}`,
+    {
+      method: "DELETE",
+      token,
+    }
+  )
+}
+
+export async function getJobMatches(token) {
+  return apiRequest("/jobs/matches", {
     method: "GET",
     token,
   })

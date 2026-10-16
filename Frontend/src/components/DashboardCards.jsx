@@ -118,22 +118,22 @@ function DashboardCards() {
     {
       title: "Jobs Found",
       value: stats.jobs_found,
-      description: "Jobs discovered from job sources",
+      description: "Relevant openings found in your job searches",
     },
     {
       title: "Matched Jobs",
       value: stats.matched_jobs,
-      description: "Jobs matching your resume",
+      description: "Saved jobs compared with a verified resume",
     },
     {
       title: "Applications",
       value: stats.applications,
-      description: "Applications in your tracker",
+      description: "Jobs saved for application follow-up",
     },
   ]
 
   return (
-    <section className="mt-6 w-full">
+    <section className="w-full">
       <div className="mb-3 flex items-center justify-between gap-3">
         <p
           aria-live="polite"

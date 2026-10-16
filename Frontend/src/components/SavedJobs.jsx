@@ -4,6 +4,7 @@ import { useAuth } from "../context/AuthContext";
 import {
   getJobs,
   getMyResumes,
+  getApplications,
   matchJobWithResume,
   prepareApplication,
   tailorJobResume,
@@ -89,6 +90,7 @@ function SavedJobs() {
 
   const [jobs, setJobs] = useState([]);
   const [resumes, setResumes] = useState([]);
+  const [trackedJobIds, setTrackedJobIds] = useState([]);
   const [selectedResumes, setSelectedResumes] = useState({});
   const [matchResults, setMatchResults] = useState({});
   const [matchingJobId, setMatchingJobId] = useState("");
@@ -132,21 +134,7 @@ function SavedJobs() {
         const response = await getJobs(token);
         const savedJobs = extractJobs(response);
 
-        console.log("SAVED JOBS API RESPONSE:", response);
-        console.log("EXTRACTED SAVED JOBS:", savedJobs);
-
         setJobs(savedJobs);
-
-        // Notify listeners that saved jobs were refreshed.
-        // Dashboard statistics are intentionally not refreshed
-        // by this event in the updated DashboardCards component.
-        window.dispatchEvent(
-          new CustomEvent("saved-jobs-updated", {
-            detail: {
-              total_jobs: savedJobs.length,
-            },
-          })
-        );
       } catch (err) {
         console.error("Failed to load saved jobs:", err);
 
@@ -182,8 +170,6 @@ function SavedJobs() {
         (resume) => resume?.resume_verified === true
       );
 
-      console.log("VERIFIED RESUMES:", verifiedResumes);
-
       setResumes(verifiedResumes);
 
       setSelectedResumes((previous) => {
@@ -217,13 +203,35 @@ function SavedJobs() {
     }
   }, [token]);
 
+  const loadTrackedJobs = useCallback(async () => {
+    if (!token) {
+      setTrackedJobIds([]);
+      return;
+    }
+
+    try {
+      const response = await getApplications(token);
+      const applications = Array.isArray(response?.applications)
+        ? response.applications
+        : [];
+      setTrackedJobIds(
+        applications.map((application) =>
+          String(application?.job_id || "")
+        ).filter(Boolean)
+      );
+    } catch (err) {
+      console.error("Failed to load tracked jobs:", err);
+    }
+  }, [token]);
+
   /* =========================
      INITIAL LOAD
   ========================= */
   useEffect(() => {
     loadJobs({ showLoading: true });
     loadResumes();
-  }, [loadJobs, loadResumes]);
+    loadTrackedJobs();
+  }, [loadJobs, loadResumes, loadTrackedJobs]);
 
   useEffect(() => {
     function handleJobsSearchCompleted() {
@@ -234,14 +242,30 @@ function SavedJobs() {
       "jobs-search-completed",
       handleJobsSearchCompleted
     );
+    window.addEventListener(
+      "saved-jobs-updated",
+      handleJobsSearchCompleted
+    );
+    window.addEventListener(
+      "applications-updated",
+      loadTrackedJobs
+    );
 
     return () => {
       window.removeEventListener(
         "jobs-search-completed",
         handleJobsSearchCompleted
       );
+      window.removeEventListener(
+        "saved-jobs-updated",
+        handleJobsSearchCompleted
+      );
+      window.removeEventListener(
+        "applications-updated",
+        loadTrackedJobs
+      );
     };
-  }, [loadJobs]);
+  }, [loadJobs, loadTrackedJobs]);
 
   /* =========================
      MANUAL REFRESH
@@ -254,6 +278,7 @@ function SavedJobs() {
     await Promise.all([
       loadJobs(),
       loadResumes(),
+      loadTrackedJobs(),
     ]);
   }
 
@@ -305,6 +330,9 @@ function SavedJobs() {
         token
       );
 
+      setTrackedJobIds((current) =>
+        current.includes(jobId) ? current : [...current, jobId]
+      );
       setTrackingMessages((previous) => ({
         ...previous,
         [jobId]:
@@ -325,6 +353,10 @@ function SavedJobs() {
   }
 
   async function handleTailorResume(job) {
+    if (matchingJobId || tailoringJobId) {
+      return
+    }
+
     const jobId = getJobId(job);
     const resumeId =
       selectedResumes[jobId] ||
@@ -372,6 +404,10 @@ function SavedJobs() {
      MATCH JOB WITH RESUME
   ========================= */
   async function handleMatchJob(job) {
+    if (matchingJobId || tailoringJobId) {
+      return
+    }
+
     const jobId = getJobId(job);
 
     const resumeId =
@@ -425,8 +461,6 @@ function SavedJobs() {
         token
       );
 
-      console.log("RESUME MATCH RESPONSE:", response);
-
       const result =
         response?.match_result ??
         response?.result ??
@@ -466,7 +500,7 @@ function SavedJobs() {
      STYLES
   ========================= */
   const sectionClass =
-    "my-6 w-full rounded-xl border border-gray-200 bg-white px-4 py-8 text-gray-900 shadow-sm sm:my-8 sm:px-6 sm:py-10 lg:px-8 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100";
+    "w-full rounded-xl border border-gray-200 bg-white px-4 py-8 text-gray-900 shadow-sm sm:px-6 sm:py-10 lg:px-8 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100";
 
   const mutedTextClass =
     "text-gray-500 dark:text-gray-400";
@@ -775,12 +809,12 @@ function SavedJobs() {
                       !jobId ||
                       !selectedResumeId ||
                       resumesLoading ||
-                      matchingJobId === jobId
+                      Boolean(matchingJobId || tailoringJobId)
                     }
                     className="mt-4 w-full rounded-lg bg-blue-600 px-5 py-3 text-sm font-medium text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"
                   >
                     {matchingJobId === jobId
-                      ? "Matching..."
+                      ? "Matching (may take minutes)..."
                       : "Match Resume"}
                   </button>
 
@@ -791,13 +825,16 @@ function SavedJobs() {
                       !jobId ||
                       !selectedResumeId ||
                       resumesLoading ||
-                      trackingJobId === jobId
+                      trackingJobId === jobId ||
+                      trackedJobIds.includes(jobId)
                     }
                     className="mt-4 w-full rounded-lg border border-gray-300 px-5 py-3 text-sm font-medium text-gray-700 transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50 sm:ml-2 sm:w-auto dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-700"
                   >
                     {trackingJobId === jobId
                       ? "Adding..."
-                      : "Add to Application Tracker"}
+                      : trackedJobIds.includes(jobId)
+                        ? "In Application Tracker"
+                        : "Add to Application Tracker"}
                   </button>
 
                   <button
@@ -807,14 +844,26 @@ function SavedJobs() {
                       !jobId ||
                       !selectedResumeId ||
                       resumesLoading ||
-                      tailoringJobId === jobId
+                      Boolean(matchingJobId || tailoringJobId)
                     }
                     className="mt-4 w-full rounded-lg border border-purple-300 px-5 py-3 text-sm font-medium text-purple-700 transition hover:bg-purple-50 disabled:cursor-not-allowed disabled:opacity-50 sm:ml-2 sm:w-auto dark:border-purple-700 dark:text-purple-300 dark:hover:bg-purple-950"
                   >
                     {tailoringJobId === jobId
-                      ? "Preparing draft..."
+                      ? "Preparing draft (may take minutes)..."
                       : "Create Resume Draft"}
                   </button>
+
+                  {(matchingJobId === jobId ||
+                    tailoringJobId === jobId) && (
+                    <p
+                      className="mt-3 text-sm text-gray-600 dark:text-gray-400"
+                      role="status"
+                    >
+                      AI is processing this request. It can take several
+                      minutes; please wait. If it times out, an error will
+                      appear here.
+                    </p>
+                  )}
 
                   {tailoringErrors[jobId] && (
                     <p
@@ -893,9 +942,49 @@ function SavedJobs() {
                           {result}
                         </p>
                       ) : (
-                        <pre className="mt-3 overflow-x-auto whitespace-pre-wrap break-words text-xs leading-6 text-green-900 dark:text-green-200">
-                          {JSON.stringify(result, null, 2)}
-                        </pre>
+                        <div className="mt-3 space-y-3 text-sm leading-6 text-green-900 dark:text-green-200">
+                          {result.summary && <p>{result.summary}</p>}
+                          {result.match_score !== undefined && (
+                            <p>
+                              <span className="font-semibold">Match score:</span>{" "}
+                              {result.match_score}%
+                            </p>
+                          )}
+                          {[
+                            ["Matched skills", result.matched_skills],
+                            [
+                              "Missing required skills",
+                              result.missing_required_skills,
+                            ],
+                            [
+                              "Matched preferred skills",
+                              result.matched_preferred_skills,
+                            ],
+                            ["Strengths", result.strengths],
+                            ["Areas to improve", result.gaps],
+                          ].map(
+                            ([label, items]) =>
+                              Array.isArray(items) &&
+                              items.length > 0 && (
+                                <div key={label}>
+                                  <p className="font-semibold">{label}</p>
+                                  <ul className="list-inside list-disc">
+                                    {items.map((item, index) => (
+                                      <li key={`${label}-${index}`}>{item}</li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )
+                          )}
+                          <p>
+                            <span className="font-semibold">Experience match:</span>{" "}
+                            {result.experience_match ? "Yes" : "No"}
+                          </p>
+                          <p>
+                            <span className="font-semibold">Location match:</span>{" "}
+                            {result.location_match ? "Yes" : "No"}
+                          </p>
+                        </div>
                       )}
                     </div>
                   )}

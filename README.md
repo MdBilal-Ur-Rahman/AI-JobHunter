@@ -9,10 +9,18 @@ URL-validated application-page inspection.
 ## Safety and data model
 
 - Web-search results are untrusted. A discovered result is not automatically
-  an authentic job or a saved normalized job.
+  an authentic job or a saved normalized job. Tavily prioritizes recognized
+  job-board domains, but URL validation does not establish that a posting is
+  genuine or still open; users should review the employer and posting.
+- Clearly informational results (such as tutorials and documentation) are
+  filtered before URL review and are reported as skipped search results.
 - The dashboard distinguishes persisted search results from normalized jobs.
-  A job is added to Saved Jobs only after the individual-posting and URL
-  validation checks pass.
+  HTTPS results that need URL verification are kept in the live-results list
+  with a manual-review label, but are not eligible to save until they pass
+  backend URL checks. A job is added to Saved Jobs only after the
+  individual-posting and URL validation checks pass. New accounts
+  automatically search for general current openings when no prior search
+  results exist.
 - Resume matching and application preparation require the user's verified
   resume.
 - Generated or mapped application data is for user review. The application
@@ -46,6 +54,12 @@ Add `MONGO_URI`, a long random `SECRET_KEY`, `TAVILY_API_KEY`, and
 private.
 `FRONTEND_ORIGINS` must list the exact frontend origin(s), comma-separated;
 for a hosted frontend, set it to that hosted origin in the backend environment.
+To enable forgot-password emails, also set `FRONTEND_BASE_URL`, `SMTP_HOST`,
+`SMTP_PORT` (normally `587` with STARTTLS), and `SMTP_FROM_EMAIL`. Set
+`SMTP_USERNAME` and `SMTP_PASSWORD` together when the mail relay requires
+authentication. Keep all SMTP credentials in the backend environment, never
+in source control. Use the deployed HTTPS frontend URL for
+`FRONTEND_BASE_URL`. Reset links are single-use and expire after 30 minutes.
 
 Install the Chromium browser used by Playwright:
 
@@ -59,7 +73,23 @@ Start the API from the `Backend` directory:
 python -m uvicorn app.main:app --reload
 ```
 
+If the virtual environment is in the repository root instead, run this from
+the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn --app-dir Backend --env-file Backend\.env app.main:app --reload
+```
+
+In VS Code, the **Backend: Start FastAPI** task runs the root virtual
+environment with `Backend` as its working directory.
+
 The API documentation is available at `http://127.0.0.1:8000/docs`.
+
+For local development only, if SMTP is not configured and you need to reset
+an existing local account, stop the API and run
+`python reset_local_password.py` from the `Backend` directory. The command
+refuses non-local MongoDB hosts, prompts for the account email, and hides
+the new password while typing.
 
 ## Frontend setup
 
@@ -79,7 +109,7 @@ build time and configure `FRONTEND_ORIGINS` to the deployed frontend origin.
 
 ## Main user flow
 
-1. Register and sign in.
+1. Register and sign in; manage your account name and email from Profile.
 2. Upload a PDF or DOCX resume, extract its text, and verify it.
 3. Save target roles and locations in Job Preferences.
 4. Search for jobs. Discovered results remain separate from verified Saved

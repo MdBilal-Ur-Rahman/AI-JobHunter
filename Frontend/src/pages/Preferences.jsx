@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react"
+import { useNavigate } from "react-router-dom"
 import Sidebar from "../components/Sidebar"
 import Header from "../components/Header"
 import { useAuth } from "../context/AuthContext"
@@ -25,6 +26,7 @@ function toList(value) {
 }
 
 function Preferences() {
+  const navigate = useNavigate()
   const { token } = useAuth()
   const [values, setValues] = useState(INITIAL_PREFERENCES)
   const [hasPreferences, setHasPreferences] = useState(false)
@@ -173,12 +175,23 @@ function Preferences() {
         <Header />
         <main className="p-4 sm:p-6 lg:p-8">
           <section className="mx-auto w-full max-w-3xl rounded-xl border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-700 dark:bg-gray-900 sm:p-6">
-            <h1 className="text-2xl font-bold text-gray-900 dark:text-white">
-              Job Preferences
-            </h1>
-            <p className="mt-1 text-sm text-gray-600 dark:text-gray-400">
-              Set target roles and locations to guide job discovery.
-            </p>
+            <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <h1 className="text-2xl font-bold text-gray-900 dark:text-white">
+                  Job Preferences
+                </h1>
+                <p className="mt-1 text-sm text-gray-600 dark:text-gray-400">
+                  Set target roles and locations to guide job discovery.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => navigate("/")}
+                className="w-full rounded-lg border border-gray-300 bg-white px-5 py-2.5 text-sm font-semibold text-gray-700 transition hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 sm:w-auto dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-gray-800"
+              >
+                ← Back to Dashboard
+              </button>
+            </div>
 
             {loading ? (
               <p className="py-8 text-sm text-gray-500 dark:text-gray-400">
