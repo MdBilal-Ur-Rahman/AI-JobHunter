@@ -37,6 +37,7 @@ from datetime import (
 
 from uuid import uuid4
 import logging
+from urllib.parse import urlsplit
 
 from tavily import TavilyClient
 
@@ -153,6 +154,21 @@ if not cors_origins or "*" in cors_origins:
     raise RuntimeError(
         "FRONTEND_ORIGINS must contain explicit frontend origins"
     )
+
+frontend_base_url = os.getenv("FRONTEND_BASE_URL", "").strip()
+if frontend_base_url:
+    parsed_frontend_url = urlsplit(frontend_base_url)
+    if (
+        parsed_frontend_url.scheme not in {"http", "https"}
+        or not parsed_frontend_url.netloc
+    ):
+        raise RuntimeError("FRONTEND_BASE_URL must be an HTTP(S) URL")
+
+    frontend_origin = (
+        f"{parsed_frontend_url.scheme}://{parsed_frontend_url.netloc}"
+    )
+    if frontend_origin not in cors_origins:
+        cors_origins.append(frontend_origin)
 
 app.add_middleware(
     CORSMiddleware,

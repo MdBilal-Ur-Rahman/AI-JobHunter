@@ -52,10 +52,12 @@ New-Item -Path .env -ItemType File
 Add `MONGO_URI`, a long random `SECRET_KEY`, `TAVILY_API_KEY`, and
 `GEMINI_API_KEY` to `Backend/.env` using your own values. Keep that file
 private.
-`FRONTEND_ORIGINS` must list the exact frontend origin(s), comma-separated;
-for a hosted frontend, set it to that hosted origin in the backend environment.
-To enable forgot-password emails, also set `FRONTEND_BASE_URL`, `SMTP_HOST`,
-`SMTP_PORT` (normally `587` with STARTTLS), and `SMTP_FROM_EMAIL`. Set
+Set `FRONTEND_BASE_URL` to the deployed frontend URL; it is used for password
+reset links and automatically added to the CORS allowlist. For this deployment,
+use `https://ai-job-hunter-phi-two.vercel.app`. `FRONTEND_ORIGINS` can list
+additional exact frontend origins, comma-separated. To enable forgot-password
+emails, also set `SMTP_HOST`, `SMTP_PORT` (normally `587` with STARTTLS), and
+`SMTP_FROM_EMAIL`. Set
 `SMTP_USERNAME` and `SMTP_PASSWORD` together when the mail relay requires
 authentication. Keep all SMTP credentials in the backend environment, never
 in source control. Use the deployed HTTPS frontend URL for
@@ -105,7 +107,10 @@ The Vite development server uses `http://127.0.0.1:8000` as the API default.
 To use another backend URL, create a local `Frontend/.env.local` containing
 `VITE_API_BASE_URL=http://your-backend-host:port`.
 For deployment, set `VITE_API_BASE_URL` to the public backend URL at frontend
-build time and configure `FRONTEND_ORIGINS` to the deployed frontend origin.
+build time and set `FRONTEND_BASE_URL` on the backend to the deployed frontend
+URL so it is allowed by CORS. For the current deployment, configure
+`VITE_API_BASE_URL=https://ai-jobhunter-backend.onrender.com` in Vercel and
+`FRONTEND_BASE_URL=https://ai-job-hunter-phi-two.vercel.app` in Render.
 
 ## Main user flow
 
